@@ -38,8 +38,8 @@ enum data_commands {
 };
 
 enum transfer_event {
-    complete,
-    abort,
+    completed,
+    aborted,
     error
 };
 

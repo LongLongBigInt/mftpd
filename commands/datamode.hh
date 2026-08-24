@@ -35,33 +35,3 @@ void do_PASV(connection &c) {
     char *p = (char *)&port, *a = (char *)&addr;
     respond<ftpd_code::pasv>(c.stream, a[0], a[1], a[2], a[3], p[0], p[1]);
 }
-
-bool prepare_data_transfer(connection &c) {
-    // assert ensure_idle()
-    switch (c.m) {
-    case transfer_mode::unset:
-        respond<ftpd_code::open_dconn_error,
-            open_dconn_error_variant::mode_not_set>(c.stream);
-        return false;
-
-    case transfer_mode::passive:
-        // 我们现在已经有一个listening的fd了，可以准备accept
-        // 直接加入事件循环
-        // 这时epoll_wait可能立即完成（因为客户端通常已经connect()了），但我们不管
-        globals::ep->add(c.dacceptor.native_handle(), {
-            epoll::in,
-            encode_ptr(handle_type::data_acceptor, c)
-        });
-        return true;
-
-    case transfer_mode::port:
-        // 我们尝试连接客户端提供的端口
-        c.dstream = sock<tcp, ip>::create_nonblock()
-            .bind_reuse({20})
-            .connect(c.daddr); // sock_base::connect()不会throw
-        globals::ep->add(c.dstream.native_handle(), {
-            epoll::out,
-            encode_ptr(handle_type::data_connector, c)
-        });
-    }
-}

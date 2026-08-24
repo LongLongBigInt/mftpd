@@ -1,6 +1,9 @@
 #pragma once
 
 #include "helper.hh"
+#include <cerrno>
+#include <cstring>
+#include <filesystem>
 
 template <printdir_variant v>
 void print_escaped_path(connection &c, const fs::path &formal_path) {
@@ -35,7 +38,9 @@ void do_CWD(connection &c, const char *path) {
     if (!ensure_idle(c)) return;
 
     fs::path target = c.wd / path;
-    if (!ensure_dir(c, target)) return;
+    if (!ensure_target(c, target, fs::file_type::directory)) {
+        return;
+    }
 
     c.wd = target;
     respond<ftpd_code::action_ok>(c.stream);
@@ -43,35 +48,40 @@ void do_CWD(connection &c, const char *path) {
 
 void do_MKD(connection &c, const char *path) {
     if (!ensure_idle(c)) return;
-
-    fs::path target = (c.wd / path).lexically_normal();
-    // if (!ensure_target(c, target, NONE)) return;
+    // TODO: 判断权限
 
     std::error_code ec;
+    fs::path target = c.wd / path;
     bool ok = fs::create_directory(target, ec);
-    if (!ok) {
-        
+    if (ec) {
+        respond<ftpd_code::action_fail,
+                action_fail_variant::system_error>(c.stream, strerror(ec.value()));
+    } else if (!ok) {
+        respond<ftpd_code::action_fail, 
+                action_fail_variant::already_exist>(c.stream);
+    } else {
+        print_escaped_path<printdir_variant::mkd>(c, target);
+    }
+}
+
+void do_remove(connection &c, const char *path, fs::file_type type) {
+    if (!ensure_idle(c)) return;
+    fs::path target = c.wd / path;
+
+    if (!ensure_target(c, target, type)) {
+        return;
     }
 
-    print_escaped_path<printdir_variant::mkd>(c, target);
-}
-
-void do_RMD(connection &c, const char *path) {
-    if (!ensure_idle(c)) return;
-
-    
-}
-
-// 删除指定的文件（不包括目录）
-void do_DELE(connection &c, const char *path) {
-    if (!ensure_idle(c)) return;
-
-    fs::path target = c.wd / path;
-    if (!ensure_dir(c, target)) return;
-
     std::error_code ec;
-    fs::remove(target, ec);
-
-    respond<ftpd_code::action_ok>(c.stream);
+    bool ok = fs::remove(target, ec);
+    if (ec) {
+        respond<ftpd_code::action_fail,
+                action_fail_variant::system_error>(c.stream, strerror(ec.value()));
+    } else if (!ok) {
+        // FIX: 跨平台
+        respond<ftpd_code::action_fail, 
+                action_fail_variant::system_error>(c.stream, strerror(ENOENT));
+    } else {
+        print_escaped_path<printdir_variant::mkd>(c, target);
+    }
 }
-

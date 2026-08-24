@@ -1,9 +1,11 @@
 #pragma once
 
+#include "helper.hh"
 #include "transfer.hh"
 
 #include "../io/utils.hh"
 
+#include <filesystem>
 #include <thread>
 
 size_t format_list(const fs::directory_entry &st, iobuf<char> buf) {
@@ -57,7 +59,7 @@ public:
     bool handle(connection &c, bool in_evloop) {
         switch (do_write(c)) {
             case LIST_handler::complete:
-                complete_data_transfer(c, transfer_event::complete, in_evloop);
+                complete_data_transfer(c, transfer_event::completed, in_evloop);
                 return true;
             case LIST_handler::error:
                 complete_data_transfer(c, transfer_event::error, in_evloop);
@@ -70,7 +72,7 @@ public:
     bool handle_worker(connection &c) {
         switch (do_write(c)) {
             case LIST_handler::complete:
-                c.ef->set(transfer_event::complete);
+                c.ef->set(transfer_event::completed);
                 return true;
             case LIST_handler::error:
                 c.ef->set(transfer_event::error);
@@ -99,7 +101,7 @@ void do_LIST_transfer(connection &c) {
             LIST_handler lh(c.dcmd.target);
             while (true) {
                 // 先看看是否有消息
-                if (c.ef->get() == transfer_event::abort) {
+                if (c.ef->get() == transfer_event::aborted) {
                     c.ef.reset();
                     globals::ep->dec();
                     return;
@@ -130,4 +132,17 @@ void do_LIST_transfer(connection &c) {
             continue;
         }
     }
+}
+
+void do_LIST(connection &c, const char *path) {
+    if (!ensure_idle(c) || !require_datamode_set(c)) {
+        return;
+    }
+
+    const fs::path &target = path ? c.wd / path : c.wd;
+    if (!ensure_target(c, target, fs::file_type::directory)) {
+        return;
+    }
+
+    prepare_data_transfer(c, data_commands::list, target);
 }

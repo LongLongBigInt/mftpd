@@ -1,6 +1,7 @@
 #pragma once
 
-#include "helper.hh"
+#include "../connection.hh"
+#include "../message.hh"
 
 // RFC 959 提及
 // Servers **may** allow a new USER command to be entered at any point 

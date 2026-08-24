@@ -5,6 +5,7 @@
 #include <netinet/in.h>
 
 #include "net/sockaddr.hh"
+#include "net/tcpsock.hh"
 
 enum ftpd_code {
     open_dconn_success = 150,
@@ -50,6 +51,8 @@ enum action_fail_variant {
     system_error,
     not_allowed,
     not_a_dir,
+    not_a_file,
+    already_exist
 };
 
 enum open_dconn_error_variant {
@@ -85,8 +88,10 @@ FTPD_DESC<syntax_error, empty_cmd> = "Syntax error, command is empty.";
 FTPD_DESC<unauth, auth_fail> = "Authentication failed.";
 FTPD_DESC<unauth, require_auth> = "Not logged in.";
 FTPD_DESC<action_fail, system_error> = "%s.";
-FTPD_DESC<action_fail, not_allowed> = "Accessing path %s is not allowed.";
-FTPD_DESC<action_fail, not_a_dir> = "The requested path %s is not a directory.";
+FTPD_DESC<action_fail, not_allowed> = "Accessing the path is not allowed.";
+FTPD_DESC<action_fail, not_a_dir> = "The requested path is not a directory.";
+FTPD_DESC<action_fail, not_a_file> = "The requested path is not a file.";
+FTPD_DESC<action_fail, already_exist> = "Path or file already exists";
 
 #undef FTPD_DESC
 

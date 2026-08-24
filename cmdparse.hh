@@ -4,6 +4,7 @@
 #include "commands/login.hh"
 #include "commands/fileop.hh"
 #include "commands/datamode.hh"
+#include <filesystem>
 
 // RFC 规定的最小实现
 // USER, QUIT, PORT, TYPE, MODE, STRU, RETR, STOR, NOOP
@@ -50,6 +51,15 @@ void cmd_dispatch(connection &c, int begin, int sep, int term) {
     }
     else if (cmd_is("CWD")) {
         if (require_arg(true)) do_CWD(c, arg);
+    }
+    else if (cmd_is("MKD")) {
+        if (require_arg(true)) do_MKD(c, arg);
+    }
+    else if (cmd_is("RMD")) {
+        if (require_arg(true)) do_remove(c, arg, fs::file_type::directory);
+    }
+    else if (cmd_is("DELE")) {
+        if (require_arg(true)) do_remove(c, arg, fs::file_type::regular);
     }
     else if (cmd_is("PORT")) {
         if (require_arg(true)) do_PORT(c, arg);

@@ -3,8 +3,15 @@ users:
   - name: test
     pass: 123456
     home: /home/scutech
-    allows:
-      - /home/alice
+    allow:
+      - r /
+      - rw /public
+      - w /uploads/test
+      - /uploads
+      - /root/public
+    disallows:
+      - /root
+
   - name: 111
   
     

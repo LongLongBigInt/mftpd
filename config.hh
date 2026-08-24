@@ -2,7 +2,6 @@
 
 #include <yaml-cpp/yaml.h>
 
-#include <cstring>
 #include <filesystem>
 
 namespace fs = std::filesystem;
