@@ -1,0 +1,10 @@
+default-home: /home
+users:
+  - name: test
+    pass: 123456
+    home: /home/scutech
+    allows:
+      - /home/alice
+  - name: 111
+  
+    
