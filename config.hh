@@ -4,9 +4,10 @@
 
 #include <filesystem>
 
-namespace fs = std::filesystem;
+#define FTPD_DEFAULT_HOME_PATH "/"
+#define FTPD_DEFAULT_CONTROL_PORT 21
 
-const char *default_home_path = "/";
+namespace fs = std::filesystem;
 
 class config {
     YAML::Node root;
@@ -21,17 +22,29 @@ public:
         return root["users"];
     }
 
+    in_addr_t host() {
+        YAML::Node n = root["host"];
+        if (!n) return ip::loopback;
+        in_addr addr;
+        int ok = inet_aton(n.Scalar().c_str(), &addr);
+        if (!ok) return ip::loopback;
+        return ntohl(addr.s_addr);
+    }
+
+    in_port_t port() {
+        YAML::Node n = root["port"];
+        if (!n) return FTPD_DEFAULT_CONTROL_PORT;
+        return n.as<in_port_t>();
+    }
+
     static fs::path get_dir(YAML::Node node) {
         if (!node) return {};
         fs::path p = node.Scalar();
         std::error_code ec;
-        // The requested access to the file is not allowed, 
-        // OR search permission is denied for one of the directories in the path prefix of pathname,
-        // OR the file did not exist yet and write access to the parent directory is not allowed.
         if (fs::is_directory(p, ec)) {
             return p;
         }
-        // warning: path non exist not a dir, ignore
+        // 路径不存在，或者不是目录
         return {};
     }
 
@@ -39,7 +52,7 @@ public:
         if (default_home_.empty()) {
             default_home_ = get_dir(root["default-home"]);
             if (default_home_.empty()) {
-                default_home_ = fs::path(default_home_path);
+                default_home_ = fs::path("/");
             }
         }
         return default_home_;
@@ -52,6 +65,10 @@ public:
             }
         }
         return YAML::Node(YAML::NodeType::Undefined);
+    }
+
+    bool ip_allowed(ip addr) {
+        return true;
     }
 
 };

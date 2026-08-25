@@ -1,0 +1,9 @@
+host: 127.0.0.1
+port: 2121
+default-home: /home
+users:
+  - name: test
+    pass: 123456
+    home: /home/scutech
+  - name: visitor
+  

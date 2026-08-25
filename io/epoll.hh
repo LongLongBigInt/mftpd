@@ -1,5 +1,6 @@
 #pragma once
 
+#include "handle.hh"
 #include "../sys/error.hh"
 
 #include <sys/epoll.h>
@@ -7,22 +8,22 @@
 #include <unistd.h>
 #include <vector>
 
-class efd {
-    int fd_;
+class efd: public iohandle {
 public:
     using value_type = eventfd_t;
-    static constexpr value_type try_again = -1;
+    static constexpr value_type try_again = 0;
 
-    efd(int initval, int flags = 0) {
+    static efd create(int initval, int flags = 0) {
+        efd ef;
         int _ = ::eventfd(initval, flags);
         if (_ == -1) THROW_LATEST;
-        fd_ = _;
+        ef.set_handle(_);
+        return ef;
     }
-    ~efd() { close(); }
-    int native_handle() { return fd_; }
+
     value_type get() {
         value_type v;
-        int _ = eventfd_read(fd_, &v);
+        int _ = eventfd_read(native_handle(), &v);
         if (_ == -1) {
             if (errno != EAGAIN) {
                 THROW_LATEST;
@@ -32,41 +33,42 @@ public:
         return v;
     }
     void set(value_type v) {
-        int _ = eventfd_write(fd_, v);
+        int _ = eventfd_write(native_handle(), v);
         if (_ == -1) THROW_LATEST;
-    }
-    bool close() {
-        return ::close(fd_) != -1;
     }
 };
 
-class epoll {
-    int epfd, n = 0;
+class epoll: public iohandle {
+    int n = 0;
 public:
-    epoll(int flags = 0) {
+    static epoll create(int flags = 0) {
+        epoll ep;
         int _ = epoll_create1(flags);
         if (_ == -1) THROW_LATEST;
-        epfd = _;
+        ep.set_handle(_);
+        return ep;
     }
-    ~epoll() { close(epfd); }
     void dec() { --n; }
     void add(int handle, struct epoll_event e) {
-        int _ = epoll_ctl(epfd, EPOLL_CTL_ADD, handle, &e);
+        int _ = epoll_ctl(native_handle(), EPOLL_CTL_ADD, handle, &e);
         if (_ == -1) THROW_LATEST;
         ++n;
     }
     void mod(int handle, struct epoll_event e) {
-        int _ = epoll_ctl(epfd, EPOLL_CTL_MOD, handle, &e);
+        int _ = epoll_ctl(native_handle(), EPOLL_CTL_MOD, handle, &e);
         if (_ == -1) THROW_LATEST;
     }
     void del(int handle) {
-        int _ = epoll_ctl(epfd, EPOLL_CTL_DEL, handle, nullptr);
+        int _ = epoll_ctl(native_handle(), EPOLL_CTL_DEL, handle, nullptr);
         if (_ == -1) THROW_LATEST;
         --n;
     }
     std::vector<struct epoll_event> wait() {
         std::vector<struct epoll_event> events(n);
-        int nevent = epoll_wait(epfd, events.data(), n, -1);
+        int nevent;
+        do {
+            nevent = epoll_wait(native_handle(), events.data(), n, -1);
+        } while (nevent == -1 && errno == EINTR);
         if (nevent == -1) THROW_LATEST;
         events.resize(nevent);
         return events;
@@ -75,5 +77,7 @@ public:
         in = EPOLLIN,
         out = EPOLLOUT,
         error = EPOLLERR,
+        hup = EPOLLHUP,
+        rdhup = EPOLLRDHUP,
     };
 };

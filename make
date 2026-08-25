@@ -1,3 +1,3 @@
 #!/bin/sh
 
-g++ -o ftpd ftpd.cc -lyaml-cpp -std=c++17
+g++ -o ftpd main.cc -lyaml-cpp -std=c++17 -pthread

@@ -1,11 +1,12 @@
 #pragma once
 
-#include "helper.hh"
-#include "transfer.hh"
+#include "globals.hh"
+#include "types.hh"
+#include "internal.hh"
 
-#include "../io/utils.hh"
+#include "io/utils.hh"
 
-#include <filesystem>
+#include <sys/stat.h>
 #include <thread>
 
 size_t format_list(const fs::directory_entry &st, iobuf<char> buf) {
@@ -42,7 +43,7 @@ public:
         }
         // 有缓冲区我们就去发送
         if (off) {
-            ssize_t n = c.dstream.send_nothrow({buf + nsend, buf + off});
+            ssize_t n = c.dstream.send_nothrow<char>({buf + nsend, buf + off});
             if (n == -1) {
                 if (errno == EAGAIN) goto ret;
                 return error;    
@@ -72,10 +73,10 @@ public:
     bool handle_worker(connection &c) {
         switch (do_write(c)) {
             case LIST_handler::complete:
-                c.ef->set(transfer_event::completed);
+                c.ef.set(transfer_event::completed);
                 return true;
             case LIST_handler::error:
-                c.ef->set(transfer_event::error);
+                c.ef.set(transfer_event::error);
                 return true;
             case LIST_handler::pending:
                 return false;
@@ -84,26 +85,30 @@ public:
 };
 
 void do_LIST_transfer(connection &c) {
-    size_t sz = fs::file_size(c.dcmd.target);
+    struct stat st;
+    if (::stat(c.dpath.c_str(), &st) == -1) {
+        THROW_LATEST;
+    }
+    size_t sz = st.st_size;
     // 先关闭读端
     c.dstream.shutdown(SHUT_RD);
 
     // 超过32k，用单独的线程
     if (sz > 32 * 1024) {
-        set_block(c.dstream.native_handle());
-        c.ef = efd(0, EFD_NONBLOCK);
-        globals::ep->add(c.ef->native_handle(), { 
+        set_block(c.dstream);
+        c.ef = efd::create(0, EFD_NONBLOCK);
+        G::ep.add(c.ef.native_handle(), { 
             epoll::in,
-            encode_ptr(handle_type::worker_event, c) 
+            encode_ptr(handle_type::worker_event, &c) 
         });
 
         auto worker = [&c] {
-            LIST_handler lh(c.dcmd.target);
+            LIST_handler lh(c.dpath);
             while (true) {
                 // 先看看是否有消息
-                if (c.ef->get() == transfer_event::aborted) {
-                    c.ef.reset();
-                    globals::ep->dec();
+                if (c.ef.get() == transfer_event::aborted) {
+                    c.ef.close();
+                    G::ep.dec();
                     return;
                 }
                 if (lh.handle_worker(c)) {
@@ -117,32 +122,19 @@ void do_LIST_transfer(connection &c) {
     }
     // 超过1k，在事件循环中处理
     else if (sz > 1024) {
-        set_nonblock(c.dstream.native_handle());
-        c.dcmd.handler = new LIST_handler(c.dcmd.target);
-        globals::ep->add(c.dstream.native_handle(), {
+        set_nonblock(c.dstream);
+        c.handler = new LIST_handler(c.dpath);
+        G::ep.add(c.dstream.native_handle(), {
             epoll::out, 
-            encode_ptr(handle_type::data_stream, c) 
+            encode_ptr(handle_type::data_stream, &c) 
         });
     }
     // 直接在这里处理
     else {
-        set_block(c.dstream.native_handle());
-        LIST_handler lh(c.dcmd.target);
+        set_block(c.dstream);
+        LIST_handler lh(c.dpath);
         while (!lh.handle(c, false)) {
             continue;
         }
     }
-}
-
-void do_LIST(connection &c, const char *path) {
-    if (!ensure_idle(c) || !require_datamode_set(c)) {
-        return;
-    }
-
-    const fs::path &target = path ? c.wd / path : c.wd;
-    if (!ensure_target(c, target, fs::file_type::directory)) {
-        return;
-    }
-
-    prepare_data_transfer(c, data_commands::list, target);
 }
