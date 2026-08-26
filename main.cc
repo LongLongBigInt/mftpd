@@ -6,7 +6,7 @@
 #include "list.hh"
 
 void on_new_connection() {
-    auto [conn, addr] = G::ctl.accept();
+    auto [conn, addr] = G::ctl.accept(); // 这里会 throw 或阻塞吗？
 
     if (!G::cfg.ip_allowed(addr)) {
         return; // 或者发送RST
@@ -32,9 +32,13 @@ enum pem_result {
 pem_result parse_and_eval_message(connection &c) {
     auto &[buf, end, skip] = c.parsing_state;
 
-    size_t n = c.stream.recv<char>({buf + end, std::end(buf)});
-    if (n == 0) { // eof
+    ssize_t n = c.stream.recv_nothrow<char>({buf + end, std::end(buf)});
+    if (n <= 0) { // eof or error
         return should_close;
+    }
+    // ready_to_close状态下读端已关闭，可能存在残留消息，需要忽略
+    if (c.s == connection_state::ready_to_close) {
+        return ok;
     }
     end += n;
 
@@ -67,16 +71,23 @@ pem_result parse_and_eval_message(connection &c) {
     return ok;
 }
 
-void on_control_message(connection *cp) {
-    switch (parse_and_eval_message(*cp)) {
+void on_control_message(connection &c) {
+    switch (parse_and_eval_message(c)) {
         case ok:
             break;
         case should_close:
-            delete cp; break;
+            // 这里注意，如果工作线程在负责数据传输
+            // 委托它进行异步销毁
+            if (c.ef.valid()) {
+                c.ef.set(transfer_event::destroy);
+            } else {
+                delete &c;
+            }
+            break;
         case message_oversize:
             respond<ftpd_code::syntax_error, 
                     syntax_error_variant::message_too_long>
-                    (cp->stream);
+                    (c.stream);
             break;
     }
 }
@@ -106,27 +117,14 @@ void on_worker_event(connection &c) {
     G::ep.dec();
 }
 
-void start_data_transfer(connection &c) {
-    respond<ftpd_code::transfer_open>(
-        c.stream, c.dpath.filename().c_str());
-
-    switch (c.dcmd) {
-        case data_commands::list:
-            do_LIST_transfer(c);
-            break;
-        case data_commands::retrieve:
-        case data_commands::store:
-            break;
-    }
-}
-
 void on_PASV_accepted(connection &c) {
-    auto [conn, _] = c.dacceptor.accept();
-    G::ep.dec();
+    auto [conn, addr] = c.dacceptor.accept();
 
-    int handle = conn.native_handle();
+    // TODO: 检验 addr 是否接受
     c.dstream = std::move(conn);
+    c.daddr = addr;
     c.dacceptor.close();
+    G::ep.dec();
 
     start_data_transfer(c);
 }
@@ -184,7 +182,7 @@ int main(int argc, char const *argv[])
 
             case handle_type::control_stream:
                 if (ev & epoll::in) {
-                    on_control_message(connp);
+                    on_control_message(*connp);
                 }
                 break;
             

@@ -3,7 +3,7 @@
 #include "types.hh"
 
 enum transfer_event {
-    completed = 1, error, aborted
+    completed = 1, error, aborted, destroy
 };
 
 union epoll_data encode_ptr(handle_type type, connection *c) {
@@ -79,17 +79,18 @@ void prepare_data_transfer(
     }
 }
 
-// 异步结束传输
-void abort_data_transfer(connection &c) {
-    if (c.ef.valid()) {
-        // 如果是线程在工作，停止它
-        // 关闭和减少计数由工作线程负责
-        c.ef.set(transfer_event::aborted);
-    } else {
-        // 否则是事件循环，得减少要移除的dstream
-        G::ep.dec();
+void start_data_transfer(connection &c) {
+    respond<ftpd_code::transfer_open>(
+        c.stream, c.dpath.filename().c_str());
+
+    switch (c.dcmd) {
+        case data_commands::list:
+            do_LIST_transfer(c);
+            break;
+        case data_commands::retrieve:
+        case data_commands::store:
+            break;
     }
-    c.dstream.close();
 }
 
 // 传输结束，回复并流转状态
@@ -105,6 +106,10 @@ void on_transfer_complete(connection &c, transfer_event e) {
         respond<ftpd_code::user_abort>(c.stream);
         break;
     }
+    if (c.s == connection_state::ready_to_close) {
+        delete &c;
+        return;
+    }
     c.m = transfer_mode::unset;
     c.s = connection_state::auth_idle;
 }
@@ -118,6 +123,38 @@ void complete_data_transfer(
     c.dstream.close();
     if (in_evloop) G::ep.dec();
     on_transfer_complete(c, e);
+}
+
+// 异步结束传输
+void abort_data_transfer(connection &c) {
+    if (c.ef.valid()) {
+        // 如果是线程在工作，停止它
+        // 关闭和减少计数由工作线程负责
+        c.ef.set(transfer_event::aborted);
+    } else {
+        // 否则是事件循环，得减少要移除的dstream
+        G::ep.dec();
+    }
+    c.dstream.close();
+}
+
+// 工作线程处理消息
+// 返回 true 表示工作线程自己要退出了
+bool worker_check_event(connection &c) {
+    switch (c.ef.get()) {
+        case efd::try_again:
+            break;
+        // ABORT 命令
+        case transfer_event::aborted:
+            c.ef.close();
+            G::ep.dec();
+            return true;
+        // 控制连接结束
+        case transfer_event::destroy:
+            delete &c;
+            return true;
+    }
+    return false;
 }
 
 bool require_permission(connection &c, const fs::path &p) {

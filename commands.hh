@@ -106,7 +106,7 @@ void do_MKD(connection &c, const char *path) {
     }
 }
 
-void do_remove(connection &c, const char *path, fs::file_type type) {
+void do_unlink(connection &c, const char *path, fs::file_type type) {
     if (!ensure_idle(c)) return;
     fs::path target = c.wd / path;
 
@@ -223,6 +223,38 @@ void do_LIST(connection &c, const char *path) {
     prepare_data_transfer(c, data_commands::list, target);
 }
 
+// void do_ABOR(connnection &c) {
+
+// }
+
+void do_REIN(connection &c) {
+    // 如果passive模式下正在等待用户连接，先关闭它
+    if (c.dacceptor.valid()) {
+        c.dacceptor.close();
+        G::ep.dec();
+    }
+    // 同理，如果port模式正在连接用户，也先关闭它
+    
+    // 如果数据连接正在进行，detach掉它，但不从evloop里移除
+    c.dstream.detach();
+    c.s = connection_state::before_auth;
+    c.m = transfer_mode::unset;
+    respond<ftpd_code::welcome>(c.stream);
+}
+
+bool do_QUIT(connection &c) {
+    // 收到响应，发221
+    respond<ftpd_code::bye>(c.stream);
+    // 如果此时没有数据传输，会直接close掉
+    if (c.m != auth_busy) {
+        return true;
+    }
+    // 否则关闭读端，设置为准备关闭的标志
+    c.stream.shutdown(SHUT_RD);
+    c.s = connection_state::ready_to_close;
+    return false;
+}
+
 bool cmd_dispatch(connection &c, int begin, int sep, int term) {
     int total_len = term - begin,
         arg_len = sep == -1 ? 0 : term - sep - 1,
@@ -270,10 +302,10 @@ bool cmd_dispatch(connection &c, int begin, int sep, int term) {
         if (require_arg(true)) do_MKD(c, arg);
     }
     else if (cmd_is("RMD")) {
-        if (require_arg(true)) do_remove(c, arg, fs::file_type::directory);
+        if (require_arg(true)) do_unlink(c, arg, fs::file_type::directory);
     }
     else if (cmd_is("DELE")) {
-        if (require_arg(true)) do_remove(c, arg, fs::file_type::regular);
+        if (require_arg(true)) do_unlink(c, arg, fs::file_type::regular);
     }
     else if (cmd_is("PORT")) {
         if (require_arg(true)) do_PORT(c, arg);
@@ -289,7 +321,7 @@ bool cmd_dispatch(connection &c, int begin, int sep, int term) {
     }
     else {
         respond<ftpd_code::syntax_error, 
-            syntax_error_variant::unrecognized_cmd>(c.stream, cmd);
+                syntax_error_variant::unrecognized_cmd>(c.stream, cmd);
     }
 
     return false;

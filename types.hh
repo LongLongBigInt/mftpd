@@ -59,4 +59,11 @@ struct connection {
     connection(sock<tcp_connected, ip> &&stream, ip addr)
         :stream(std::move(stream)), addr(addr) {}
 
+    ~connection() {
+        if (stream.valid()) G::ep.dec();
+        if (dstream.valid()) G::ep.dec();
+        if (dacceptor.valid()) G::ep.dec();
+        if (ef.valid()) G::ep.dec();
+    }
+
 };

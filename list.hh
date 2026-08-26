@@ -105,10 +105,7 @@ void do_LIST_transfer(connection &c) {
         auto worker = [&c] {
             LIST_handler lh(c.dpath);
             while (true) {
-                // 先看看是否有消息
-                if (c.ef.get() == transfer_event::aborted) {
-                    c.ef.close();
-                    G::ep.dec();
+                if (worker_check_event(c)) {
                     return;
                 }
                 if (lh.handle_worker(c)) {
