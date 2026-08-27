@@ -73,10 +73,14 @@ public:
     bool handle_worker(connection &c) {
         switch (do_write(c)) {
             case LIST_handler::complete:
-                c.ef.set(transfer_event::completed);
+                c.ef.set(efd::unit);
                 return true;
             case LIST_handler::error:
-                c.ef.set(transfer_event::error);
+                // 发现问题，尝试设置错误
+                // 期望是completed（默认），如果发现主线程在刚刚已经设置为别的值则放弃
+                transfer_event expect = transfer_event::completed;
+                c.wf.compare_exchange_strong(expect, transfer_event::error);
+                c.ef.set(efd::unit);
                 return true;
             case LIST_handler::pending:
                 return false;
@@ -96,7 +100,7 @@ void do_LIST_transfer(connection &c) {
     // 超过32k，用单独的线程
     if (sz > 32 * 1024) {
         set_block(c.dstream);
-        c.ef = efd::create(0, EFD_NONBLOCK);
+        c.ef = efd::create();
         G::ep.add(c.ef.native_handle(), { 
             epoll::in,
             encode_ptr(handle_type::worker_event, &c) 
@@ -105,7 +109,7 @@ void do_LIST_transfer(connection &c) {
         auto worker = [&c] {
             LIST_handler lh(c.dpath);
             while (true) {
-                if (worker_check_event(c)) {
+                if (worker_check_flag(c)) {
                     return;
                 }
                 if (lh.handle_worker(c)) {

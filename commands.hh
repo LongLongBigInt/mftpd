@@ -6,7 +6,7 @@
 #include "internal.hh"
 
 void do_USER(connection &c, const char *name) {
-    if (c.s == connection_state::auth_idle || c.s == connection_state::auth_busy) {
+    if (c.s > connection_state::need_pass) {
         // 本用户重复USER视为已登录，否则不支持重新登录
         if (c.u["name"].Scalar() == name) {
             respond<ftpd_code::logged_in>(c.stream);
@@ -26,6 +26,7 @@ void do_PASS(connection &c, const char *pass) {
         respond<ftpd_code::bad_sequence>(c.stream);
         return;
     }
+
     if (!c.u) goto pass_fail;
 
     if (!c.u["pass"] || c.u["pass"].Scalar() == pass) {
@@ -38,7 +39,7 @@ pass_fail:
     return;
 
 pass_success:
-    c.s = connection_state::auth_idle;
+    c.s = connection_state::idle;
     c.wd = config::get_dir(c.u["home"]);
     if (c.wd.empty()) {
         c.wd = G::cfg.default_home();
@@ -72,33 +73,40 @@ void print_escaped_path(connection &c, const fs::path &formal_path) {
 }
 
 void do_PWD(connection &c) {
-    if (!ensure_idle(c)) return;
-    print_escaped_path<printdir_variant::pwd>(c, c.wd.lexically_normal());
+    if (!ensure_auth(c)) return;
+
+    print_escaped_path<printdir_variant::pwd>
+        (c, c.wd.lexically_normal());
 }
 
 void do_CWD(connection &c, const char *path) {
-    if (!ensure_idle(c)) return;
+    if (!ensure_auth(c)) return;
 
     fs::path target = c.wd / path;
     if (!ensure_target(c, target, fs::file_type::directory)) {
         return;
     }
 
-    c.wd = target;
+    // TODO: 如果超长，lexically_normal整理一下
+    c.wd = std::move(target);
     respond<ftpd_code::action_ok>(c.stream);
 }
 
 void do_MKD(connection &c, const char *path) {
-    if (!ensure_idle(c)) return;
-    // TODO: 判断权限
+    if (!ensure_auth(c)) return;
+
+    fs::path target = c.wd / path;
+
+    // 这里省一次ensure_target，直接调用require_permission验证
+    if (!require_permission(c, target)) return;
 
     std::error_code ec;
-    fs::path target = c.wd / path;
     bool ok = fs::create_directory(target, ec);
     if (ec) {
         respond<ftpd_code::action_fail,
                 action_fail_variant::system_error>(c.stream, strerror(ec.value()));
     } else if (!ok) {
+        // 目录已存在ec会被清空，会进入这里；fs::remove()也类似
         respond<ftpd_code::action_fail, 
                 action_fail_variant::already_exist>(c.stream);
     } else {
@@ -107,12 +115,11 @@ void do_MKD(connection &c, const char *path) {
 }
 
 void do_unlink(connection &c, const char *path, fs::file_type type) {
-    if (!ensure_idle(c)) return;
+    if (!ensure_auth(c)) return;
+
     fs::path target = c.wd / path;
 
-    if (!ensure_target(c, target, type)) {
-        return;
-    }
+    if (!ensure_target(c, target, type)) return;
 
     std::error_code ec;
     bool ok = fs::remove(target, ec);
@@ -129,16 +136,14 @@ void do_unlink(connection &c, const char *path, fs::file_type type) {
 }
 
 void do_TYPE(connection &c, const char *type) {
-    if (!ensure_idle(c)) return;
+    if (!ensure_auth(c)) return;
 
-    switch (toupper(type[0])) {
-    case 'A':
-    case 'I':
+    if (strcasecmp(type, "I") == 0) {
         respond<ftpd_code::common_ok>(c.stream, "TYPE");
-        break;
-    default:
-        respond<ftpd_code::invalid_argument>(c.stream);
+        return;
     }
+
+    respond<ftpd_code::invalid_argument>(c.stream);
 }
 
 ip resolve_PORT_addr(const char *addr_str /* 1,2,3,4,5,6 */) {
@@ -175,7 +180,9 @@ ip resolve_PORT_addr(const char *addr_str /* 1,2,3,4,5,6 */) {
 }
 
 void do_PORT(connection &c, const char *dest_str) {
-    if (!ensure_idle(c)) return;
+    if (!ensure_auth(c)) return;
+    // 连接时发送PORT/PASV行为未定义，这里530拒绝
+    if (!ensure_not_in_transfer(c)) return;
     
     if (c.m == transfer_mode::passive) {
         c.dacceptor.close();
@@ -186,14 +193,18 @@ void do_PORT(connection &c, const char *dest_str) {
         respond<ftpd_code::invalid_argument>(c.stream);
         return;
     }
+
     // TODO: 检查ip是否允许
+
     c.daddr = addr;
     c.m = transfer_mode::port;
+    
     respond<ftpd_code::common_ok>(c.stream, "PORT");
 }
 
 void do_PASV(connection &c) {
-    if (!ensure_idle(c)) return;
+    if (!ensure_auth(c)) return;
+    if (!ensure_not_in_transfer(c)) return;
 
     // TODO: 在限制的端口范围中挑选一个
     // 这里我们先直接使用系统给定的端口
@@ -204,14 +215,16 @@ void do_PASV(connection &c) {
         .listen(10);
     c.daddr = c.dacceptor.addr();
     c.m = transfer_mode::passive;
+
     in_port_t port = htons(c.daddr.port);
     in_addr_t addr = htonl(c.daddr.addr);
     char *p = (char *)&port, *a = (char *)&addr;
-    respond<ftpd_code::pasv>(c.stream, a[0], a[1], a[2], a[3], p[0], p[1]);
+    respond<ftpd_code::pasv>(c.stream, 
+        a[0], a[1], a[2], a[3], p[0], p[1]);
 }
 
 void do_LIST(connection &c, const char *path) {
-    if (!ensure_idle(c) || !require_datamode_set(c)) {
+    if (!ensure_transferable(c)) {
         return;
     }
 
@@ -223,9 +236,52 @@ void do_LIST(connection &c, const char *path) {
     prepare_data_transfer(c, data_commands::list, target);
 }
 
-// void do_ABOR(connnection &c) {
+void do_ABOR(connection &c) {
+    if (c.s < connection_state::idle) {
+        goto no_transfer;
+    }
+    
+    if (c.s < connection_state::in_transfer) {
+        switch (c.m) {
+        case transfer_mode::unset:
+            goto no_transfer;
 
-// }
+        case transfer_mode::passive:
+            c.dacceptor.close();
+            if (c.s == connection_state::before_transfer) {
+                G::ep.dec();
+            }
+            goto not_open;
+
+        case transfer_mode::port:
+            if (c.s == connection_state::before_transfer) {
+                c.dstream.close();
+                G::ep.dec();
+            }
+            goto not_open;
+        }
+    }
+
+    // 已经在传输中了，我们根据ef判断是哪种情况
+    if (c.ef.valid()) {
+        // 为线程设置abort标志
+        c.wf.store(transfer_event::aborted);
+    } else {
+        // 是事件循环，直接操作
+        complete_data_transfer(c, transfer_event::aborted, true);
+    }
+    return;
+
+no_transfer:
+    respond<ftpd_code::common_ok>(c.stream, "ABORT");
+    return;
+
+not_open:
+    c.s = connection_state::idle;
+    c.m = transfer_mode::unset;
+    respond<ftpd_code::common_ok>(c.stream, "ABORT");
+    return;
+}
 
 void do_REIN(connection &c) {
     // 如果passive模式下正在等待用户连接，先关闭它
@@ -235,18 +291,35 @@ void do_REIN(connection &c) {
     }
     // 同理，如果port模式正在连接用户，也先关闭它
     
-    // 如果数据连接正在进行，detach掉它，但不从evloop里移除
-    c.dstream.detach();
-    c.s = connection_state::before_auth;
-    c.m = transfer_mode::unset;
-    respond<ftpd_code::welcome>(c.stream);
+    // 根据规范，如果数据传输还在，不应该中断它
+    // 这里我们创建一个新的connection用于新用户
+    // 然后像QUIT一样，打上ready_to_close标签
+    // 当数据传输完毕后，complete_data_transfer会检查这个标记并释放它
+    if (c.s == connection_state::in_transfer) {
+        int fd = c.stream.native_handle();
+        G::ep.mod(fd, {
+            epoll::in, 
+            encode_ptr(
+                handle_type::control_stream,
+                new connection(c.stream.dup(), c.addr)
+            )
+        });
+        c.s = connection_state::ready_to_close;
+    } else {
+        c.dstream.detach();
+        c.s = connection_state::before_auth;
+        c.m = transfer_mode::unset;
+
+        // 接待新用户
+        respond<ftpd_code::welcome>(c.stream);
+    }
 }
 
 bool do_QUIT(connection &c) {
-    // 收到响应，发221
     respond<ftpd_code::bye>(c.stream);
-    // 如果此时没有数据传输，会直接close掉
-    if (c.m != auth_busy) {
+    // 如果此时没有数据传输，可以直接close掉
+    if (c.m != connection_state::in_transfer) {
+        // 调用方随即会调用delete &c，这也将自动释放可能正在连接的pasv/port socket
         return true;
     }
     // 否则关闭读端，设置为准备关闭的标志
@@ -318,6 +391,15 @@ bool cmd_dispatch(connection &c, int begin, int sep, int term) {
     }
     else if (cmd_is("LIST")) {
         do_LIST(c, arg_len ? arg : nullptr);
+    }
+    else if (cmd_is("ABOR")) {
+        if (require_arg(false)) do_ABOR(c);
+    }
+    else if (cmd_is("REIN")) {
+        if (require_arg(false)) do_REIN(c);
+    }
+    else if (cmd_is("QUIT")) {
+        if (require_arg(false)) do_QUIT(c);
     }
     else {
         respond<ftpd_code::syntax_error, 

@@ -57,7 +57,7 @@ enum action_fail_variant {
     already_exist
 };
 
-enum open_dconn_error_variant {
+enum transfer_not_open_variant {
     mode_not_set,
     socket_error
 };
@@ -176,6 +176,12 @@ void respond(sock<tcp_connected, ip> &stream, Args... args) {
     buf[off++] = '\r';
     buf[off++] = '\n';
     while (send < off) {
-        send += stream.send<char>({buf + send, buf + off});
+        ssize_t n = stream.send_nothrow<char>({buf + send, buf + off});
+        if (n <= 0) {
+            // 出现错误
+            // 这里我们不处理，留给epoll::in的分支去做
+            return;
+        } 
+        send += n;
     }
 }

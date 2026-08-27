@@ -2,10 +2,6 @@
 
 #include "types.hh"
 
-enum transfer_event {
-    completed = 1, error, aborted, destroy
-};
-
 union epoll_data encode_ptr(handle_type type, connection *c) {
     if (type == control_acceptor) return { .u64 = 0 };
     return { .u64 = (uintptr_t) c | (uintptr_t) type };
@@ -19,46 +15,61 @@ decode_ptr(union epoll_data data) {
     return { (handle_type) t, (connection *) p };
 }
 
-bool ensure_idle(connection &c) {
-    switch (c.s) {
-    case connection_state::before_auth:
+bool ensure_auth(connection &c) {
+    if (c.s == connection_state::need_pass) {
+        respond<ftpd_code::bad_sequence>(c.stream);
+        return false;
+    }
+    if (c.s == connection_state::before_auth) {
         respond<ftpd_code::unauth, 
                 unauth_variant::require_auth>(c.stream);
-        break;
-
-    case connection_state::need_pass:
-        respond<ftpd_code::bad_sequence>(c.stream);
-        break;
-
-    case connection_state::auth_idle:
-        return true;
-
-    case connection_state::auth_busy:
-        respond<ftpd_code::busy>(c.stream);
-        break;
-    }
-    return false;
-}
-
-bool require_datamode_set(connection &c) {
-    if (c.m == transfer_mode::unset) {
-        respond<ftpd_code::transfer_not_open,
-                open_dconn_error_variant::mode_not_set>(c.stream);
-        return false; 
+        return false;
     }
     return true;
 }
 
-// 数据传输命令前调用
-// 确保 ensure_idle(c) && require_datamode_set(c)
+bool ensure_not_in_transfer(connection &c) {
+    if (c.s == connection_state::before_transfer ||
+        c.s == connection_state::in_transfer) {
+        respond<ftpd_code::bad_sequence>(c.stream);
+        return false;
+    }
+    return true;
+}
+
+bool ensure_transferable(connection &c) {
+    if (!ensure_auth(c)) return false;
+    if (!ensure_not_in_transfer(c)) return false;
+
+    if (c.m == transfer_mode::unset) {
+        respond<ftpd_code::transfer_not_open,
+                transfer_not_open_variant::mode_not_set>(c.stream);
+        return false; 
+    }
+
+    return true;
+}
+
+// 数据传输流程
+// 收到数据传输命令后：
+// [state: idle]
+// assert ensure_transferable(c)
+// prepare_data_transfer()
+// [state: before_transfer]
+// await evloop
+// start_data_transfer()
+// [state: in_transfer]
+// await evloop
+// complete_data_transfer()
+
 void prepare_data_transfer(
     connection &c,
     data_commands cmd,
     const fs::path &path
 ) {
     c.dcmd = cmd;
-    c.dpath = path;
-    c.s = connection_state::auth_busy;
+    c.dpath = std::move(path);
+    c.s = connection_state::before_transfer;
 
     switch (c.m) {     
     case transfer_mode::passive:
@@ -82,6 +93,7 @@ void prepare_data_transfer(
 void start_data_transfer(connection &c) {
     respond<ftpd_code::transfer_open>(
         c.stream, c.dpath.filename().c_str());
+    c.s = connection_state::in_transfer;
 
     switch (c.dcmd) {
         case data_commands::list:
@@ -96,22 +108,22 @@ void start_data_transfer(connection &c) {
 // 传输结束，回复并流转状态
 void on_transfer_complete(connection &c, transfer_event e) {
     switch (e) {
-    case transfer_event::completed:
-        respond<ftpd_code::transfer_ok>(c.stream);
-        break;
-    case transfer_event::error:
-        respond<ftpd_code::transfer_fail>(c.stream);
-        break;
-    case transfer_event::aborted:
-        respond<ftpd_code::user_abort>(c.stream);
-        break;
+        case transfer_event::completed:
+            respond<ftpd_code::transfer_ok>(c.stream);
+            break;
+        case transfer_event::error:
+            respond<ftpd_code::transfer_fail>(c.stream);
+            break;
+        case transfer_event::aborted:
+            respond<ftpd_code::user_abort>(c.stream);
+            break;
     }
     if (c.s == connection_state::ready_to_close) {
         delete &c;
         return;
     }
     c.m = transfer_mode::unset;
-    c.s = connection_state::auth_idle;
+    c.s = connection_state::idle;
 }
 
 // 同步结束传输，并发送消息
@@ -125,33 +137,13 @@ void complete_data_transfer(
     on_transfer_complete(c, e);
 }
 
-// 异步结束传输
-void abort_data_transfer(connection &c) {
-    if (c.ef.valid()) {
-        // 如果是线程在工作，停止它
-        // 关闭和减少计数由工作线程负责
-        c.ef.set(transfer_event::aborted);
-    } else {
-        // 否则是事件循环，得减少要移除的dstream
-        G::ep.dec();
-    }
-    c.dstream.close();
-}
-
 // 工作线程处理消息
 // 返回 true 表示工作线程自己要退出了
-bool worker_check_event(connection &c) {
-    switch (c.ef.get()) {
-        case efd::try_again:
-            break;
-        // ABORT 命令
-        case transfer_event::aborted:
-            c.ef.close();
-            G::ep.dec();
-            return true;
-        // 控制连接结束
+bool worker_check_flag(connection &c) {
+    switch (c.wf.load()) {
         case transfer_event::destroy:
-            delete &c;
+        case transfer_event::aborted:
+            c.ef.set(efd::unit);
             return true;
     }
     return false;

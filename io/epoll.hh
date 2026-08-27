@@ -12,8 +12,9 @@ class efd: public iohandle {
 public:
     using value_type = eventfd_t;
     static constexpr value_type try_again = 0;
+    static constexpr value_type unit = 1;
 
-    static efd create(int initval, int flags = 0) {
+    static efd create(int initval = 0, int flags = 0) {
         efd ef;
         int _ = ::eventfd(initval, flags);
         if (_ == -1) THROW_LATEST;

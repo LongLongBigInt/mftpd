@@ -5,13 +5,17 @@
 #include "commands.hh"
 #include "list.hh"
 
+#include <unordered_set>
+
 void on_new_connection() {
-    auto [conn, addr] = G::ctl.accept(); // 这里会 throw 或阻塞吗？
+    // 这一步在linux中不会抛出或阻塞，除非EMFILE
+    auto [conn, addr] = G::ctl.accept();
 
     if (!G::cfg.ip_allowed(addr)) {
         return; // 或者发送RST
     }
-    printf("New connection from %s\n", addr.to_string().c_str());
+
+    DEBUG("New connection from %s", addr.to_string().c_str());
 
     int handle = conn.native_handle();
     respond<ftpd_code::welcome>(conn);
@@ -25,11 +29,11 @@ void on_new_connection() {
     });
 }
 
-enum pem_result {
+enum PEM_result {
     ok, should_close, message_oversize
 };
 
-pem_result parse_and_eval_message(connection &c) {
+PEM_result parse_and_eval_message(connection &c) {
     auto &[buf, end, skip] = c.parsing_state;
 
     ssize_t n = c.stream.recv_nothrow<char>({buf + end, std::end(buf)});
@@ -59,6 +63,7 @@ pem_result parse_and_eval_message(connection &c) {
             sep = -1;
         }
     }
+
     if (begin == 0 && end == FTPD_MAX_MSG_LEN) {
         skip = true;
         end = 0;
@@ -71,19 +76,27 @@ pem_result parse_and_eval_message(connection &c) {
     return ok;
 }
 
-void on_control_message(connection &c) {
+void on_control_message(connection &c, std::unordered_set<connection *> &skips) {
     switch (parse_and_eval_message(c)) {
         case ok:
             break;
+
         case should_close:
-            // 这里注意，如果工作线程在负责数据传输
-            // 委托它进行异步销毁
             if (c.ef.valid()) {
-                c.ef.set(transfer_event::destroy);
+                // 如果工作线程在负责数据传输，委托它进行异步销毁
+                // 如果是QUIT命令返回true导致should_close，此时是没有数据连接的
+                // 因此这个路径只在控制连接收到eof/error时才触发
+                // 这里无条件设置c.wf = destroy，即使覆盖了工作线程设置的error也没关系
+                // 因为error已经没意义了
+                c.wf.store(transfer_event::destroy);
             } else {
+                // 防止同一批次稍后的连接或者worker有消息，我们在这里mask一下
+                skips.insert(&c);
+                // 不管当前状态是什么（dacceptor或者dconnector怎么样），析构函数总能正确处理
                 delete &c;
             }
             break;
+
         case message_oversize:
             respond<ftpd_code::syntax_error, 
                     syntax_error_variant::message_too_long>
@@ -99,6 +112,10 @@ void invoke_data_handler(connection &c) {
 }
 
 void on_data_message(connection &c, uint32_t ev) {
+    // 这里可能之前处理了abort命令，我们已经把dstream关闭了，这是同一批的残留
+    // 这里我们看到dstream失效后直接忽略
+    if (!c.dstream.valid()) return;
+
     switch (c.dcmd) {
         case data_commands::list:
             if (ev & (epoll::out | epoll::error | epoll::hup)) {
@@ -111,8 +128,17 @@ void on_data_message(connection &c, uint32_t ev) {
     }
 }
 
-void on_worker_event(connection &c) {
-    complete_data_transfer(c, (transfer_event) c.ef.get(), false);
+void on_worker_event(connection &c, std::unordered_set<connection *> &skips) {
+    transfer_event ev = c.wf.load();
+
+    if (ev == transfer_event::destroy) {
+        skips.insert(&c);
+        delete &c;
+        return;
+    }
+
+    complete_data_transfer(c, ev, false);
+
     c.ef.close();
     G::ep.dec();
 }
@@ -121,8 +147,16 @@ void on_PASV_accepted(connection &c) {
     auto [conn, addr] = c.dacceptor.accept();
 
     // TODO: 检验 addr 是否接受
+    // 这里暂时写成与控制连接的ip是否一致
+    if (addr.addr != c.addr.addr) {
+        return;
+    }
+
+    // 注意这里新连接还不添加到事件循环中，下同
+    // 是否添加取决于handler的策略
     c.dstream = std::move(conn);
     c.daddr = addr;
+
     c.dacceptor.close();
     G::ep.dec();
 
@@ -131,19 +165,22 @@ void on_PASV_accepted(connection &c) {
 
 void on_PORT_connected(connection &c) {
     int err = c.dstream.get_error();
+    // 不论成功与否，connector应该从事件循环中被移除
     G::ep.del(c.dstream.native_handle());
 
-    if (err) {
-        c.dstream.close();
-        respond<ftpd_code::transfer_not_open,
-                open_dconn_error_variant::socket_error>
-                (c.stream, strerror(err));
-        c.m = transfer_mode::unset;
-        c.s = connection_state::auth_idle;
+    if (!err) {
+        start_data_transfer(c);
         return;
     }
 
-    start_data_transfer(c);
+    // 连接失败
+    c.dstream.close();
+    respond<ftpd_code::transfer_not_open,
+            transfer_not_open_variant::socket_error>
+            (c.stream, strerror(err));
+
+    c.m = transfer_mode::unset;
+    c.s = connection_state::idle;
 }
 
 int main(int argc, char const *argv[])
@@ -169,8 +206,14 @@ int main(int argc, char const *argv[])
              { epoll::in, encode_ptr(control_acceptor, nullptr) });
 
     while (true) {
+        std::unordered_set<connection *> skips;
+
         for (auto [ev, data]: G::ep.wait()) {
             auto [type, connp] = decode_ptr(data);
+
+            if (!skips.empty() && skips.count(connp)) {
+                continue;
+            }
 
             switch (type) {
 
@@ -182,18 +225,18 @@ int main(int argc, char const *argv[])
 
             case handle_type::control_stream:
                 if (ev & epoll::in) {
-                    on_control_message(*connp);
+                    on_control_message(*connp, skips);
                 }
                 break;
             
             case handle_type::data_acceptor:
-                if (ev & (epoll::in | epoll::error | epoll::hup)) {
+                if (ev & epoll::in) {
                     on_PASV_accepted(*connp);
                 }
                 break;
 
             case handle_type::data_connector:
-                if (ev & (epoll::out | epoll::error | epoll::hup)) {
+                if (ev & epoll::out) {
                     on_PORT_connected(*connp);
                 }
                 break;
@@ -204,7 +247,7 @@ int main(int argc, char const *argv[])
             
             case handle_type::worker_event:
                 if (ev & epoll::in) {
-                    on_worker_event(*connp);
+                    on_worker_event(*connp, skips);
                 }
                 break;
             }
