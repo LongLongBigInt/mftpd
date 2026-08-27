@@ -3,7 +3,7 @@
 #include "message.hh"
 #include "internal.hh"
 #include "commands.hh"
-#include "list.hh"
+#include "transfer.hh"
 
 #include <unordered_set>
 
@@ -107,7 +107,7 @@ void on_control_message(connection &c, std::unordered_set<connection *> &skips) 
 
 template <typename handler>
 void invoke_data_handler(connection &c) {
-    auto hp = (handler *) c.handler;
+    auto hp = (data_handler<handler> *) c.handler;
     if (hp->handle(c, true)) delete hp;
 }
 
@@ -118,7 +118,7 @@ void on_data_message(connection &c, uint32_t ev) {
 
     switch (c.dcmd) {
         case data_commands::list:
-            if (ev & (epoll::out | epoll::error | epoll::hup)) {
+            if (ev & epoll::out) {
                 invoke_data_handler<LIST_handler>(c);
             }
             break;
@@ -141,6 +141,21 @@ void on_worker_event(connection &c, std::unordered_set<connection *> &skips) {
 
     c.ef.close();
     G::ep.dec();
+}
+
+void start_data_transfer(connection &c) {
+    respond<ftpd_code::transfer_open>(
+        c.stream, c.dpath.filename().c_str());
+    c.s = connection_state::in_transfer;
+
+    switch (c.dcmd) {
+        case data_commands::list:
+            do_LIST_transfer(c);
+            break;
+        case data_commands::retrieve:
+        case data_commands::store:
+            break;
+    }
 }
 
 void on_PASV_accepted(connection &c) {

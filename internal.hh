@@ -1,6 +1,10 @@
 #pragma once
 
 #include "types.hh"
+#include "message.hh"
+#include "io/utils.hh"
+
+#include <thread>
 
 union epoll_data encode_ptr(handle_type type, connection *c) {
     if (type == control_acceptor) return { .u64 = 0 };
@@ -28,7 +32,7 @@ bool ensure_auth(connection &c) {
     return true;
 }
 
-bool ensure_not_in_transfer(connection &c) {
+bool ensure_idle(connection &c) {
     if (c.s == connection_state::before_transfer ||
         c.s == connection_state::in_transfer) {
         respond<ftpd_code::bad_sequence>(c.stream);
@@ -39,7 +43,7 @@ bool ensure_not_in_transfer(connection &c) {
 
 bool ensure_transferable(connection &c) {
     if (!ensure_auth(c)) return false;
-    if (!ensure_not_in_transfer(c)) return false;
+    if (!ensure_idle(c)) return false;
 
     if (c.m == transfer_mode::unset) {
         respond<ftpd_code::transfer_not_open,
@@ -53,10 +57,10 @@ bool ensure_transferable(connection &c) {
 // 数据传输流程
 // 收到数据传输命令后：
 // [state: idle]
-// assert ensure_transferable(c)
+// assert ensure_transferable()
 // prepare_data_transfer()
 // [state: before_transfer]
-// await evloop
+// await evloop <- abort_transfer_preparation()
 // start_data_transfer()
 // [state: in_transfer]
 // await evloop
@@ -80,6 +84,7 @@ void prepare_data_transfer(
         break;
 
     case transfer_mode::port:
+        // TODO: 允许配置使用特定的ip连接
         c.dstream = sock<tcp, ip>::create_nonblock()
             .connect(c.daddr); // sock_base::connect()不会throw
         G::ep.add(c.dstream.native_handle(), {
@@ -90,23 +95,37 @@ void prepare_data_transfer(
     }
 }
 
-void start_data_transfer(connection &c) {
-    respond<ftpd_code::transfer_open>(
-        c.stream, c.dpath.filename().c_str());
-    c.s = connection_state::in_transfer;
-
-    switch (c.dcmd) {
-        case data_commands::list:
-            do_LIST_transfer(c);
+// 取消由pasv/port启动的端口；对于idle以前的状态是noop
+void abort_transfer_preparation(connection &c) {
+    switch (c.m) {
+        case transfer_mode::unset:
             break;
-        case data_commands::retrieve:
-        case data_commands::store:
+
+        case transfer_mode::passive:
+            c.dacceptor.close();
+            if (c.s == connection_state::before_transfer) {
+                G::ep.dec();
+            }
+            break;
+
+        case transfer_mode::port:
+            if (c.s == connection_state::before_transfer) {
+                c.dstream.close();
+                G::ep.dec();
+            }
             break;
     }
 }
 
-// 传输结束，回复并流转状态
-void on_transfer_complete(connection &c, transfer_event e) {
+// 同步结束传输，并发送消息
+void complete_data_transfer(
+    connection &c, 
+    transfer_event e, 
+    bool in_evloop
+) {
+    c.dstream.close();
+    if (in_evloop) G::ep.dec();
+
     switch (e) {
         case transfer_event::completed:
             respond<ftpd_code::transfer_ok>(c.stream);
@@ -118,23 +137,17 @@ void on_transfer_complete(connection &c, transfer_event e) {
             respond<ftpd_code::user_abort>(c.stream);
             break;
     }
-    if (c.s == connection_state::ready_to_close) {
-        delete &c;
-        return;
-    }
-    c.m = transfer_mode::unset;
-    c.s = connection_state::idle;
-}
 
-// 同步结束传输，并发送消息
-void complete_data_transfer(
-    connection &c, 
-    transfer_event e, 
-    bool in_evloop
-) {
-    c.dstream.close();
-    if (in_evloop) G::ep.dec();
-    on_transfer_complete(c, e);
+    if (c.s == connection_state::ready_to_close) {
+        if (c.detached) {
+            // REIN前的旧连接，不销毁控制连接，也不释放ep计数
+            c.stream.detach();
+        }
+        delete &c;
+    } else {
+        c.m = transfer_mode::unset;
+        c.s = connection_state::idle;
+    }
 }
 
 // 工作线程处理消息
@@ -149,11 +162,10 @@ bool worker_check_flag(connection &c) {
     return false;
 }
 
-bool require_permission(connection &c, const fs::path &p) {
+bool ensure_permission(connection &c, const fs::path &p) {
     // TODO: 完成权限解析
     // 逐级往上找，如果pi是某个allows项则允许，是某个disallows项则禁止
     // 如果不属于任何匹配结果则禁止
-    // 实际上更复杂，先不考虑了
     return true;
 }
 
@@ -170,7 +182,7 @@ bool ensure_target(
     fs::file_status *status_out_p = nullptr,
     bool follow_sym = true
 ) {
-    if (!require_permission(c, target_path)) {
+    if (!ensure_permission(c, target_path)) {
         return false;
     }
 
@@ -213,3 +225,82 @@ bool ensure_target(
     // TODO: 查看文件是否被占用
     return true;
 }
+
+
+enum class handler_poll_result {
+    complete, error, pending
+};
+
+template <typename T>
+struct data_handler: public T {
+    using T::T;
+
+    bool handle(connection &c, bool in_evloop) {
+        switch (T::operator()(c)) {
+            case handler_poll_result::complete:
+                complete_data_transfer(c, transfer_event::completed, in_evloop);
+                return true;
+
+            case handler_poll_result::error:
+                complete_data_transfer(c, transfer_event::error, in_evloop);
+                return true;
+
+            case handler_poll_result::pending:
+                return false;
+        }
+    }
+
+    bool handle_worker(connection &c) {
+        switch (T::operator()(c)) {
+            case handler_poll_result::complete:
+                c.ef.set(efd::unit);
+                return true;
+            
+            case handler_poll_result::error: {
+                // 发现问题，尝试设置错误
+                // 期望是completed（默认），如果发现主线程在刚刚已经设置为别的值则放弃
+                transfer_event expect = transfer_event::completed;
+                c.wf.compare_exchange_strong(expect, transfer_event::error);
+                c.ef.set(efd::unit);
+                return true;
+            }
+
+            case handler_poll_result::pending:
+                return false;
+        }
+    }
+    
+    static void start_sync(connection &c) {
+        set_block(c.dstream);
+        data_handler<T> hdl(c);
+        while (!hdl.handle(c, false)) {
+            continue;
+        }
+    }
+
+    static void start_worker(connection &c) {
+        set_block(c.dstream);
+        c.ef = efd::create();
+        G::ep.add(c.ef.native_handle(), { 
+            epoll::in,
+            encode_ptr(handle_type::worker_event, &c) 
+        });
+
+        auto worker = [&c] {
+            data_handler<T> handler(c);
+            while (true) {
+                if (worker_check_flag(c)) {
+                    return;
+                }
+                if (handler.handle_worker(c)) {
+                    // 正常结束或者退出了
+                    return;
+                }
+            }
+        };
+
+        std::thread(worker).detach();
+    }
+
+
+};

@@ -40,6 +40,7 @@ struct connection {
     // 控制连接
     sock<tcp_connected, ip> stream;
     ip addr;
+    bool detached = false;
 
     // 数据连接
     sock<tcp_connected, ip> dstream;

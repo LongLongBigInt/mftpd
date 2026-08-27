@@ -1,6 +1,7 @@
 #pragma once
 
 #include "globals.hh"
+#include "net/sockbase.hh"
 #include "types.hh"
 #include "message.hh"
 #include "internal.hh"
@@ -98,7 +99,7 @@ void do_MKD(connection &c, const char *path) {
     fs::path target = c.wd / path;
 
     // 这里省一次ensure_target，直接调用require_permission验证
-    if (!require_permission(c, target)) return;
+    if (!ensure_permission(c, target)) return;
 
     std::error_code ec;
     bool ok = fs::create_directory(target, ec);
@@ -182,7 +183,7 @@ ip resolve_PORT_addr(const char *addr_str /* 1,2,3,4,5,6 */) {
 void do_PORT(connection &c, const char *dest_str) {
     if (!ensure_auth(c)) return;
     // 连接时发送PORT/PASV行为未定义，这里530拒绝
-    if (!ensure_not_in_transfer(c)) return;
+    if (!ensure_idle(c)) return;
     
     if (c.m == transfer_mode::passive) {
         c.dacceptor.close();
@@ -204,7 +205,7 @@ void do_PORT(connection &c, const char *dest_str) {
 
 void do_PASV(connection &c) {
     if (!ensure_auth(c)) return;
-    if (!ensure_not_in_transfer(c)) return;
+    if (!ensure_idle(c)) return;
 
     // TODO: 在限制的端口范围中挑选一个
     // 这里我们先直接使用系统给定的端口
@@ -237,29 +238,16 @@ void do_LIST(connection &c, const char *path) {
 }
 
 void do_ABOR(connection &c) {
-    if (c.s < connection_state::idle) {
-        goto no_transfer;
-    }
-    
-    if (c.s < connection_state::in_transfer) {
-        switch (c.m) {
-        case transfer_mode::unset:
-            goto no_transfer;
+    if (c.s < connection_state::in_transfer) {   
+        abort_transfer_preparation(c);
 
-        case transfer_mode::passive:
-            c.dacceptor.close();
-            if (c.s == connection_state::before_transfer) {
-                G::ep.dec();
-            }
-            goto not_open;
-
-        case transfer_mode::port:
-            if (c.s == connection_state::before_transfer) {
-                c.dstream.close();
-                G::ep.dec();
-            }
-            goto not_open;
+        c.m = transfer_mode::unset;
+        if (c.s > connection_state::idle) {
+            c.s = connection_state::idle;
         }
+
+        respond<ftpd_code::common_ok>(c.stream, "ABORT");
+        return;
     }
 
     // 已经在传输中了，我们根据ef判断是哪种情况
@@ -271,54 +259,41 @@ void do_ABOR(connection &c) {
         complete_data_transfer(c, transfer_event::aborted, true);
     }
     return;
-
-no_transfer:
-    respond<ftpd_code::common_ok>(c.stream, "ABORT");
-    return;
-
-not_open:
-    c.s = connection_state::idle;
-    c.m = transfer_mode::unset;
-    respond<ftpd_code::common_ok>(c.stream, "ABORT");
-    return;
 }
 
 void do_REIN(connection &c) {
-    // 如果passive模式下正在等待用户连接，先关闭它
-    if (c.dacceptor.valid()) {
-        c.dacceptor.close();
-        G::ep.dec();
+    if (c.s < connection_state::in_transfer) {   
+        abort_transfer_preparation(c);
+        c.s = connection_state::before_auth;
+        c.m = transfer_mode::unset;
     }
-    // 同理，如果port模式正在连接用户，也先关闭它
-    
+
     // 根据规范，如果数据传输还在，不应该中断它
     // 这里我们创建一个新的connection用于新用户
     // 然后像QUIT一样，打上ready_to_close标签
     // 当数据传输完毕后，complete_data_transfer会检查这个标记并释放它
-    if (c.s == connection_state::in_transfer) {
+    else if (c.s == connection_state::in_transfer) {
         int fd = c.stream.native_handle();
-        G::ep.mod(fd, {
+        auto &dup = *(sock<tcp_connected, ip> *) &fd; // small hack
+        G::ep.mod(c.stream.native_handle(), {
             epoll::in, 
             encode_ptr(
                 handle_type::control_stream,
-                new connection(c.stream.dup(), c.addr)
+                new connection(std::move(dup), c.addr)
             )
         });
         c.s = connection_state::ready_to_close;
-    } else {
-        c.dstream.detach();
-        c.s = connection_state::before_auth;
-        c.m = transfer_mode::unset;
-
-        // 接待新用户
-        respond<ftpd_code::welcome>(c.stream);
+        c.detached = true;
     }
+
+    // 接待新用户
+    respond<ftpd_code::welcome>(c.stream);
 }
 
 bool do_QUIT(connection &c) {
     respond<ftpd_code::bye>(c.stream);
     // 如果此时没有数据传输，可以直接close掉
-    if (c.m != connection_state::in_transfer) {
+    if (c.s != connection_state::in_transfer) {
         // 调用方随即会调用delete &c，这也将自动释放可能正在连接的pasv/port socket
         return true;
     }
