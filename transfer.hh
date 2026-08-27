@@ -10,7 +10,7 @@
 #include <sys/stat.h>
 
 size_t format_list(const fs::directory_entry &st, iobuf<char> buf) {
-    // 权限 大小 上次修改时间 文件名
+    // TODO: 权限 大小 上次修改时间 文件名 ...
 
     int sz = snprintf(buf.base, buf.len, "%s\n", st.path().filename().c_str());
     if (sz < 0 || sz >= buf.len) return 0;

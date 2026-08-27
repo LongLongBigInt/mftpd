@@ -7,7 +7,6 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
-#include <utility>
 #include <tuple>
 
 class sock_base: public iohandle {

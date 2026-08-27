@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cstddef>
+
 template <typename T>
 struct iobuf {
     T *base;

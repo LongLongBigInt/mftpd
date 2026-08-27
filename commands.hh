@@ -374,7 +374,7 @@ bool cmd_dispatch(connection &c, int begin, int sep, int term) {
         if (require_arg(false)) do_REIN(c);
     }
     else if (cmd_is("QUIT")) {
-        if (require_arg(false)) do_QUIT(c);
+        if (require_arg(false)) return do_QUIT(c);
     }
     else {
         respond<ftpd_code::syntax_error, 
