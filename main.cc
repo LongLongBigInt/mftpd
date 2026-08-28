@@ -17,16 +17,11 @@ void on_new_connection() {
 
     DEBUG("New connection from %s", addr.to_string().c_str());
 
-    int handle = conn.native_handle();
-    respond<ftpd_code::welcome>(conn);
+    auto &c = *new connection(std::move(conn), addr);
+    respond<ftpd_code::welcome>(c.stream);
 
-    G::ep.add(handle, {
-        epoll::in,
-        encode_ptr(
-            handle_type::control_stream,
-            new connection(std::move(conn), addr)
-        )
-    });
+    G::ep.add(c.stream, { epoll::in, 
+        encode_ptr(handle_type::control_stream, &c)});
 }
 
 enum PEM_result {
@@ -89,7 +84,7 @@ void on_control_message(connection &c, std::unordered_set<connection *> &skips) 
                 // 这里无条件设置c.wf = destroy，即使覆盖了工作线程设置的error也没关系
                 // 因为error已经没意义了
                 c.wf.store(transfer_event::destroy);
-            } else {
+            } else {    
                 // 防止同一批次稍后的连接或者worker有消息，我们在这里mask一下
                 skips.insert(&c);
                 // 不管当前状态是什么（dacceptor或者dconnector怎么样），析构函数总能正确处理
@@ -105,27 +100,13 @@ void on_control_message(connection &c, std::unordered_set<connection *> &skips) 
     }
 }
 
-template <typename handler>
-void invoke_data_handler(connection &c) {
-    auto hp = (data_handler<handler> *) c.handler;
-    if (hp->handle(c, true)) delete hp;
-}
-
 void on_data_message(connection &c, uint32_t ev) {
     // 这里可能之前处理了abort命令，我们已经把dstream关闭了，这是同一批的残留
     // 这里我们看到dstream失效后直接忽略
     if (!c.dstream.valid()) return;
 
-    switch (c.dcmd) {
-        case data_commands::list:
-            if (ev & epoll::out) {
-                invoke_data_handler<LIST_handler>(c);
-            }
-            break;
-        case data_commands::retrieve:
-        case data_commands::store:
-            break;
-    }
+    // TODO 可能delete c，需要skip
+    c.handler->handle(c);
 }
 
 void on_worker_event(connection &c, std::unordered_set<connection *> &skips) {
@@ -137,10 +118,10 @@ void on_worker_event(connection &c, std::unordered_set<connection *> &skips) {
         return;
     }
 
-    complete_data_transfer(c, ev, false);
-
     c.ef.close();
-    G::ep.dec();
+
+    // TODO 可能delete c，需要skip
+    complete_data_transfer(c, ev);
 }
 
 void start_data_transfer(connection &c) {
@@ -173,7 +154,6 @@ void on_PASV_accepted(connection &c) {
     c.daddr = addr;
 
     c.dacceptor.close();
-    G::ep.dec();
 
     start_data_transfer(c);
 }
@@ -181,7 +161,7 @@ void on_PASV_accepted(connection &c) {
 void on_PORT_connected(connection &c) {
     int err = c.dstream.get_error();
     // 不论成功与否，connector应该从事件循环中被移除
-    G::ep.del(c.dstream.native_handle());
+    G::ep.del(c.dstream);
 
     if (!err) {
         start_data_transfer(c);
@@ -217,8 +197,8 @@ int main(int argc, char const *argv[])
 
     G::ep = epoll::create();
 
-    G::ep.add(G::ctl.native_handle(), 
-             { epoll::in, encode_ptr(control_acceptor, nullptr) });
+    G::ep.add(G::ctl, { epoll::in, 
+        encode_ptr(control_acceptor, nullptr) });
 
     while (true) {
         std::unordered_set<connection *> skips;

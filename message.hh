@@ -172,7 +172,8 @@ void respond(sock<tcp_connected, ip> &stream, Args... args) {
     char buf[FTPD_MAX_RES_LEN];
     size_t off = 0, send = 0;
     off += sprintf(buf + off, "%d ", code);
-    off += snprintf(buf + off, sizeof(buf)-off-2, description_of<code, variant>, args...);
+    int len = snprintf(buf + off, sizeof(buf)-off-2, description_of<code, variant>, args...);
+    off = std::min(off + len, sizeof(buf) - 2);
     buf[off++] = '\r';
     buf[off++] = '\n';
     while (send < off) {

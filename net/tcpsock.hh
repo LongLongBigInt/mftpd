@@ -71,9 +71,6 @@ class sock<proto_variant::tcp_connected, Addr>: public sock_base {
     friend class sock<proto_variant::tcp_bound, Addr>;
     friend class sock<proto_variant::tcp_listening, Addr>;
 
-    // allow in sock<tcp_listening>::accept
-    sock(int fd) { set_handle(fd); }
-
     // allow in sock::connect
     template <proto_variant T>
     sock(sock<T, Addr> &&connected): sock_base((sock_base &&)connected) {}
@@ -81,6 +78,10 @@ class sock<proto_variant::tcp_connected, Addr>: public sock_base {
 public:
     sock() = default;
     
+    // allow in sock<tcp_listening>::accept
+    // 同时方便do_REIN
+    sock(int fd) { set_handle(fd); }
+
     using sock_base::send;
     using sock_base::send_nothrow;
     using sock_base::recv;

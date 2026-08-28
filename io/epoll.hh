@@ -21,7 +21,6 @@ public:
         ef.set_handle(_);
         return ef;
     }
-
     value_type get() {
         value_type v;
         int _ = eventfd_read(native_handle(), &v);
@@ -50,19 +49,21 @@ public:
         return ep;
     }
     void dec() { --n; }
-    void add(int handle, struct epoll_event e) {
-        int _ = epoll_ctl(native_handle(), EPOLL_CTL_ADD, handle, &e);
+    void add(iohandle &ih, struct epoll_event e) {
+        int _ = epoll_ctl(native_handle(), EPOLL_CTL_ADD, ih.native_handle(), &e);
         if (_ == -1) THROW_LATEST;
+        ih.set_evloop(this);
         ++n;
     }
-    void mod(int handle, struct epoll_event e) {
-        int _ = epoll_ctl(native_handle(), EPOLL_CTL_MOD, handle, &e);
+    void mod(iohandle &ih, struct epoll_event e) {
+        int _ = epoll_ctl(native_handle(), EPOLL_CTL_MOD, ih.native_handle(), &e);
         if (_ == -1) THROW_LATEST;
     }
-    void del(int handle) {
-        int _ = epoll_ctl(native_handle(), EPOLL_CTL_DEL, handle, nullptr);
+    void del(iohandle &ih) {
+        int _ = epoll_ctl(native_handle(), EPOLL_CTL_DEL, ih.native_handle(), nullptr);
         if (_ == -1) THROW_LATEST;
         --n;
+        ih.set_evloop(nullptr);
     }
     std::vector<struct epoll_event> wait() {
         std::vector<struct epoll_event> events(n);

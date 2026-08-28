@@ -36,6 +36,8 @@ enum transfer_event {
 
 using user_data_p = YAML::Node;
 
+struct data_handler;
+
 struct connection {
     // 控制连接
     sock<tcp_connected, ip> stream;
@@ -54,7 +56,7 @@ struct connection {
     transfer_mode m = unset; /* 当前数据传输模式 */
     data_commands dcmd; /* 当前数据传输命令 */
     fs::path dpath; /* 当前数据传输路径 */
-    void *handler; /* 数据传输处理器 */
+    std::unique_ptr<data_handler> handler;
     efd ef; /* 接收工作线程信息的eventfd */
     std::atomic<transfer_event> wf = transfer_event::completed; /* 主线程给工作线程的标志 */
 
@@ -67,12 +69,4 @@ struct connection {
 
     connection(sock<tcp_connected, ip> &&stream, ip addr)
         :stream(std::move(stream)), addr(addr) {}
-
-    ~connection() {
-        if (stream.valid()) G::ep.dec();
-        if (dstream.valid()) G::ep.dec();
-        if (dacceptor.valid()) G::ep.dec();
-        if (ef.valid()) G::ep.dec();
-    }
-
 };

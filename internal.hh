@@ -77,7 +77,7 @@ void prepare_data_transfer(
 
     switch (c.m) {     
     case transfer_mode::passive:
-        G::ep.add(c.dacceptor.native_handle(), {
+        G::ep.add(c.dacceptor, {
             epoll::in,
             encode_ptr(handle_type::data_acceptor, &c)
         });
@@ -87,7 +87,7 @@ void prepare_data_transfer(
         // TODO: 允许配置使用特定的ip连接
         c.dstream = sock<tcp, ip>::create_nonblock()
             .connect(c.daddr); // sock_base::connect()不会throw
-        G::ep.add(c.dstream.native_handle(), {
+        G::ep.add(c.dstream, {
             epoll::out,
             encode_ptr(handle_type::data_connector, &c)
         });
@@ -103,28 +103,21 @@ void abort_transfer_preparation(connection &c) {
 
         case transfer_mode::passive:
             c.dacceptor.close();
-            if (c.s == connection_state::before_transfer) {
-                G::ep.dec();
-            }
             break;
 
         case transfer_mode::port:
             if (c.s == connection_state::before_transfer) {
                 c.dstream.close();
-                G::ep.dec();
             }
             break;
     }
 }
 
 // 同步结束传输，并发送消息
-void complete_data_transfer(
-    connection &c, 
-    transfer_event e, 
-    bool in_evloop
-) {
+// 注意此路径可能会导致connection析构（如果处于ready_to_close状态）
+void complete_data_transfer(connection &c, transfer_event e) {
+    c.handler.reset();
     c.dstream.close();
-    if (in_evloop) G::ep.dec();
 
     switch (e) {
         case transfer_event::completed:
@@ -140,7 +133,6 @@ void complete_data_transfer(
 
     if (c.s == connection_state::ready_to_close) {
         if (c.detached) {
-            // REIN前的旧连接，不销毁控制连接，也不释放ep计数
             c.stream.detach();
         }
         delete &c;
@@ -226,23 +218,24 @@ bool ensure_target(
     return true;
 }
 
+struct data_handler {
 
-enum class handler_poll_result {
-    complete, error, pending
-};
+    enum class handler_poll_result {
+        complete, error, pending
+    };
 
-template <typename T>
-struct data_handler: public T {
-    using T::T;
+    virtual ~data_handler() = default;
 
-    bool handle(connection &c, bool in_evloop) {
-        switch (T::operator()(c)) {
+    virtual handler_poll_result operator() (connection &c) = 0;
+
+    bool handle(connection &c) {
+        switch ((*this)(c)) {
             case handler_poll_result::complete:
-                complete_data_transfer(c, transfer_event::completed, in_evloop);
+                complete_data_transfer(c, transfer_event::completed);
                 return true;
 
             case handler_poll_result::error:
-                complete_data_transfer(c, transfer_event::error, in_evloop);
+                complete_data_transfer(c, transfer_event::error);
                 return true;
 
             case handler_poll_result::pending:
@@ -251,56 +244,24 @@ struct data_handler: public T {
     }
 
     bool handle_worker(connection &c) {
-        switch (T::operator()(c)) {
+        switch ((*this)(c)) {
             case handler_poll_result::complete:
-                c.ef.set(efd::unit);
-                return true;
+                break;
             
             case handler_poll_result::error: {
                 // 发现问题，尝试设置错误
                 // 期望是completed（默认），如果发现主线程在刚刚已经设置为别的值则放弃
                 transfer_event expect = transfer_event::completed;
                 c.wf.compare_exchange_strong(expect, transfer_event::error);
-                c.ef.set(efd::unit);
-                return true;
+                break;
             }
 
             case handler_poll_result::pending:
                 return false;
         }
+
+        c.ef.set(efd::unit);
+        return true;
     }
-    
-    static void start_sync(connection &c) {
-        set_block(c.dstream);
-        data_handler<T> hdl(c);
-        while (!hdl.handle(c, false)) {
-            continue;
-        }
-    }
-
-    static void start_worker(connection &c) {
-        set_block(c.dstream);
-        c.ef = efd::create();
-        G::ep.add(c.ef.native_handle(), { 
-            epoll::in,
-            encode_ptr(handle_type::worker_event, &c) 
-        });
-
-        auto worker = [&c] {
-            data_handler<T> handler(c);
-            while (true) {
-                if (worker_check_flag(c)) {
-                    return;
-                }
-                if (handler.handle_worker(c)) {
-                    // 正常结束或者退出了
-                    return;
-                }
-            }
-        };
-
-        std::thread(worker).detach();
-    }
-
 
 };

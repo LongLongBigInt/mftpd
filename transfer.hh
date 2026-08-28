@@ -9,6 +9,41 @@
 #include <filesystem>
 #include <sys/stat.h>
 
+template <typename T, typename... Args>
+void start_sync(connection &c, Args &&... args) {
+    set_block(c.dstream);
+    T hdl(std::forward<Args>(args)...);
+    while (!hdl.handle(c)) {
+        continue;
+    }
+}
+
+template <typename T, typename... Args>
+void start_worker(connection &c, Args... args) {
+    set_block(c.dstream);
+    c.ef = efd::create();
+    G::ep.add(c.ef, { 
+        epoll::in,
+        encode_ptr(handle_type::worker_event, &c) 
+    });
+
+    auto worker = [&c](Args... args) {
+        T handler(c);
+        while (true) {
+            if (worker_check_flag(c)) {
+                return;
+            }
+            if (handler.handle_worker(c)) {
+                // 正常结束或者退出了
+                return;
+            }
+        }
+    };
+
+    std::thread(worker, args...).detach();
+}
+
+
 size_t format_list(const fs::directory_entry &st, iobuf<char> buf) {
     // TODO: 权限 大小 上次修改时间 文件名 ...
 
@@ -17,7 +52,7 @@ size_t format_list(const fs::directory_entry &st, iobuf<char> buf) {
     return sz;
 }
 
-class LIST_handler {
+class LIST_handler: public data_handler {
     char buf[32 * 1024];
     size_t nsend = 0, off = 0;
     fs::directory_iterator it, end;
@@ -25,7 +60,7 @@ class LIST_handler {
 public:
     LIST_handler(connection &c): it(c.dpath) {}
 
-    handler_poll_result operator()(connection &c) {
+    handler_poll_result operator()(connection &c) override {
         // 现在可写了，我们先准备发送剩余的数据
         // 如果暂时还没有要发送的数据，我们去解析和准备数据
         if (!off) {
@@ -68,19 +103,19 @@ void do_LIST_transfer(connection &c) {
 
     // 超过32k，用单独的线程
     if (sz > 32 * 1024) {
-        data_handler<LIST_handler>::start_worker(c);
+        start_worker<LIST_handler>(c, std::ref(c));
     }
     // 超过1k，在事件循环中处理
     else if (sz > 1024) {
         set_nonblock(c.dstream);
-        c.handler = new data_handler<LIST_handler>(c);
-        G::ep.add(c.dstream.native_handle(), {
+        c.handler = std::make_unique<LIST_handler>(c);
+        G::ep.add(c.dstream, {
             epoll::out, 
             encode_ptr(handle_type::data_stream, &c) 
         });
     }
     // 直接在这里处理
     else {
-        data_handler<LIST_handler>::start_sync(c);
+        start_sync<LIST_handler>(c, c);
     }
 }

@@ -254,11 +254,12 @@ void do_ABOR(connection &c) {
     if (c.ef.valid()) {
         // 为线程设置abort标志
         c.wf.store(transfer_event::aborted);
+        // 同时shutdown()打断阻塞中的socket
+        c.dstream.shutdown(SHUT_RDWR);
     } else {
         // 是事件循环，直接操作
-        complete_data_transfer(c, transfer_event::aborted, true);
+        complete_data_transfer(c, transfer_event::aborted);
     }
-    return;
 }
 
 void do_REIN(connection &c) {
@@ -269,21 +270,21 @@ void do_REIN(connection &c) {
     }
 
     // 根据规范，如果数据传输还在，不应该中断它
-    // 这里我们创建一个新的connection用于新用户
+    // 这里我们创建一个新的connection用于新用户，转移原有连接
+    // 原有连接c.stream变成一个不在事件循环、不持有资源的视图
     // 然后像QUIT一样，打上ready_to_close标签
     // 当数据传输完毕后，complete_data_transfer会检查这个标记并释放它
     else if (c.s == connection_state::in_transfer) {
-        int fd = c.stream.native_handle();
-        auto &dup = *(sock<tcp_connected, ip> *) &fd; // small hack
-        G::ep.mod(c.stream.native_handle(), {
-            epoll::in, 
-            encode_ptr(
-                handle_type::control_stream,
-                new connection(std::move(dup), c.addr)
-            )
-        });
+        auto &new_c = *new connection(std::move(c.stream), c.addr);
+
+        c.stream = sock<tcp_connected, ip>(new_c.stream.native_handle());
         c.s = connection_state::ready_to_close;
         c.detached = true;
+
+        // 新连接接管控制连接：其 stream 与旧连接同一 fd（仍注册在 epoll 中），
+        // 只需把注册的数据指针改指向 new_c。注意不能用 new_c.dstream（此刻无效）。
+        G::ep.mod(new_c.stream, { epoll::in,
+            encode_ptr(handle_type::control_stream, &new_c)});
     }
 
     // 接待新用户
