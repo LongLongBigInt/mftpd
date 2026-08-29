@@ -138,7 +138,7 @@ void do_unlink(connection &c, const char *path, bool is_regular) {
 void do_TYPE(connection &c, const char *type) {
     if (!ensure_auth(c)) return;
 
-    if (strcasecmp(type, "I") == 0) {
+    if (strcasecmp(type, "I") == 0 || strcasecmp(type, "A") == 0) {
         respond<ftpd_code::common_ok>(c.stream, "TYPE");
         return;
     }
@@ -296,6 +296,7 @@ bool do_QUIT(connection &c) {
     }
     // 否则关闭读端，设置为准备关闭的标志
     c.stream.shutdown(SHUT_RD);
+    G::ep.del(c.stream); // 避免触发EOF
     c.s = connection_state::ready_to_close;
     return false;
 }

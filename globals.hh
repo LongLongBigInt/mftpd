@@ -14,8 +14,9 @@
 
 #define FTPD_DEFAULT_CONFIG_PATH "/etc/ftpd/config.yaml"
 
-#define DEBUG(FMT, ...) \
-printf(FMT "\n", __VA_ARGS__)
+#define DEBUG(FMT, ...) printf("[DEBUG] " FMT "\n", __VA_ARGS__)
+
+#define INFO(FMT, ...) printf("[INFO] " FMT "\n", __VA_ARGS__)
 
 namespace G
 {

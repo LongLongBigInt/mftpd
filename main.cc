@@ -5,7 +5,7 @@
 #include "commands.hh"
 #include "transfer.hh"
 
-#include <unordered_set>
+#include <csignal>
 
 void on_new_connection() {
     // 这一步在linux中不会抛出或阻塞，除非EMFILE
@@ -77,10 +77,11 @@ void on_control_message(connection &c) {
                 // 如果工作线程在负责数据传输，委托它进行异步销毁
                 // 如果是QUIT命令返回true导致should_close，此时是没有数据连接的
                 // 因此这个路径只在控制连接收到eof/error时才触发
-                // 这里无条件设置c.wf = destroy，即使覆盖了工作线程设置的error也没关系
-                // 因为error已经没意义了
+                // 我们这里先关闭数据连接
+                c.stream.close();
                 c.wf.store(transfer_event::destroy);
-            } else {    
+                c.ef.set(efd::unit);
+            } else {
                 // 其余清理直接由析构函数进行
                 delete &c;
             }
@@ -154,20 +155,18 @@ void on_PORT_connected(connection &c) {
 
 int main(int argc, char const *argv[])
 {
+    signal(SIGPIPE, SIG_IGN);
+
     const char *conf_path = "config.yaml.test";
     G::cfg.load(conf_path);
 
-    printf("Config loaded from %s\n", conf_path);
+    INFO("Config loaded from %s", conf_path);
 
     G::ctl = sock<tcp, ip>::create()
-        .bind_reuse({
-            G::cfg.port(), 
-            G::cfg.host()
-        })
+        .bind_reuse({ G::cfg.port(), G::cfg.host() })
         .listen(FTPD_BACKLOG);
         
-    printf("Service listening on %s\n", 
-           G::ctl.addr().to_string().c_str());
+    INFO("Service listening on %s", G::ctl.addr().to_string().c_str());
 
     G::ep = epoll::create();
 

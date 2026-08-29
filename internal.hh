@@ -170,15 +170,16 @@ bool ensure_target(
     }
     struct stat buf, *st = status_out_p ? status_out_p : &buf;
 
-    int _ = stat(target_path.c_str(), st);
+    int _ = stat(target_path.c_str(), st),
+        ec = _ == -1 ? errno : 0;
 
-    bool match = (_ == -1 && errno == ENOENT)
+    bool match = ec == ENOENT
         ? expected_type == 0
         : (st->st_mode & S_IFMT) == expected_type;
 
-    if (!match && errno) {
+    if (!match && ec) {
         respond<ftpd_code::action_fail, action_fail_variant::system_error>
-            (c.stream, strerror(errno));
+            (c.stream, strerror(ec));
         return false;
     }
     // 现在要么没错误，要么匹配
@@ -192,7 +193,7 @@ bool ensure_target(
                     action_fail_variant::already_exist>(c.stream);
             break;
         case S_IFDIR:
-            // RMD
+            // RMD, LIST
             respond<ftpd_code::action_fail,
                     action_fail_variant::not_a_dir>(c.stream);
             break;
@@ -240,7 +241,7 @@ struct data_handler {
             
             case handler_poll_result::error: {
                 // 发现问题，尝试设置错误
-                // 期望是completed（默认），如果发现主线程在刚刚已经设置为别的值则放弃
+                // 期望是默认的none，如果发现主线程在刚刚已经设置为别的值则放弃
                 transfer_event expect = transfer_event::none;
                 c.wf.compare_exchange_strong(expect, transfer_event::error);
                 break;

@@ -36,6 +36,7 @@ void start_worker(connection &c, Args... args) {
                 return;
             }
         }
+        c.ef.set(efd::unit);
     };
 
     std::thread(worker, args...).detach();
