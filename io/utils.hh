@@ -4,6 +4,7 @@
 #include "handle.hh"
 
 #include <fcntl.h>
+#include <sys/stat.h>
 
 int get_file_flags(iohandle &h) {
     int _ = fcntl(h.native_handle(), F_GETFL);

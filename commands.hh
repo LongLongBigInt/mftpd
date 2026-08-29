@@ -48,7 +48,6 @@ pass_success:
     respond<ftpd_code::logged_in>(c.stream);
 }
 
-
 template <printdir_variant v>
 void print_escaped_path(connection &c, const fs::path &formal_path) {
     const char *str = formal_path.c_str();
@@ -84,7 +83,7 @@ void do_CWD(connection &c, const char *path) {
     if (!ensure_auth(c)) return;
 
     fs::path target = c.wd / path;
-    if (!ensure_target(c, target, fs::file_type::directory)) {
+    if (!ensure_target(c, target, S_IFDIR)) {
         return;
     }
 
@@ -115,12 +114,12 @@ void do_MKD(connection &c, const char *path) {
     }
 }
 
-void do_unlink(connection &c, const char *path, fs::file_type type) {
+void do_unlink(connection &c, const char *path, bool is_regular) {
     if (!ensure_auth(c)) return;
 
     fs::path target = c.wd / path;
 
-    if (!ensure_target(c, target, type)) return;
+    if (!ensure_target(c, target, is_regular ? S_IFREG : S_IFDIR)) return;
 
     std::error_code ec;
     bool ok = fs::remove(target, ec);
@@ -180,16 +179,12 @@ ip resolve_PORT_addr(const char *addr_str /* 1,2,3,4,5,6 */) {
     return addr;
 }
 
-void do_PORT(connection &c, const char *dest_str) {
+void do_PORT(connection &c, const char *addrstr) {
     if (!ensure_auth(c)) return;
     // 连接时发送PORT/PASV行为未定义，这里530拒绝
     if (!ensure_idle(c)) return;
-    
-    if (c.m == transfer_mode::passive) {
-        c.dacceptor.close();
-    }
 
-    ip addr = resolve_PORT_addr(dest_str);
+    ip addr = resolve_PORT_addr(addrstr);
     if (addr.port == 0) {
         respond<ftpd_code::invalid_argument>(c.stream);
         return;
@@ -197,6 +192,7 @@ void do_PORT(connection &c, const char *dest_str) {
 
     // TODO: 检查ip是否允许
 
+    abort_transfer_preparation(c);
     c.daddr = addr;
     c.m = transfer_mode::port;
     
@@ -206,14 +202,14 @@ void do_PORT(connection &c, const char *dest_str) {
 void do_PASV(connection &c) {
     if (!ensure_auth(c)) return;
     if (!ensure_idle(c)) return;
+    
+    abort_transfer_preparation(c);
 
-    // TODO: 在限制的端口范围中挑选一个
+    // TODO: 在限制的端口范围和ip中挑选一个
     // 这里我们先直接使用系统给定的端口
-    // 如果先前已经有了，我们直接使用operator=换掉
-    // 根据RFC规范，这里创建出来在回复之前要直接listen()
     c.dacceptor = sock<tcp, ip>::create()
         .bind_reuse({0, G::cfg.host()})
-        .listen(10);
+        .listen(FTPD_BACKLOG);
     c.daddr = c.dacceptor.addr();
     c.m = transfer_mode::passive;
 
@@ -230,7 +226,7 @@ void do_LIST(connection &c, const char *path) {
     }
 
     const fs::path &target = path ? c.wd / path : c.wd;
-    if (!ensure_target(c, target, fs::file_type::directory)) {
+    if (!ensure_target(c, target, S_IFDIR, &c.dst)) {
         return;
     }
 
@@ -317,7 +313,7 @@ bool cmd_dispatch(connection &c, int begin, int sep, int term) {
     cmd[cmd_len] = arg[arg_len] = '\0'; // 如果没有arg_len相当于设置cmd[cmd_len+1]即\n上
 
     auto cmd_is = [&](const char *c) {
-        return cmd_len == strlen(c) && strcasecmp(c, cmd) == 0;
+        return strcasecmp(c, cmd) == 0;
     };
 
     auto require_arg = [arg_len, &c](bool required) {
@@ -351,10 +347,10 @@ bool cmd_dispatch(connection &c, int begin, int sep, int term) {
         if (require_arg(true)) do_MKD(c, arg);
     }
     else if (cmd_is("RMD")) {
-        if (require_arg(true)) do_unlink(c, arg, fs::file_type::directory);
+        if (require_arg(true)) do_unlink(c, arg, false);
     }
     else if (cmd_is("DELE")) {
-        if (require_arg(true)) do_unlink(c, arg, fs::file_type::regular);
+        if (require_arg(true)) do_unlink(c, arg, true);
     }
     else if (cmd_is("PORT")) {
         if (require_arg(true)) do_PORT(c, arg);

@@ -3,6 +3,7 @@
 #include "globals.hh"
 
 #include <atomic>
+#include <sys/stat.h>
 
 enum handle_type {
     control_acceptor,
@@ -31,7 +32,7 @@ enum data_commands {
 };
 
 enum transfer_event {
-    completed, error, aborted, destroy
+    none, error, aborted, destroy
 };
 
 using user_data_p = YAML::Node;
@@ -56,9 +57,10 @@ struct connection {
     transfer_mode m = unset; /* 当前数据传输模式 */
     data_commands dcmd; /* 当前数据传输命令 */
     fs::path dpath; /* 当前数据传输路径 */
+    struct stat dst;
     std::unique_ptr<data_handler> handler;
     efd ef; /* 接收工作线程信息的eventfd */
-    std::atomic<transfer_event> wf = transfer_event::completed; /* 主线程给工作线程的标志 */
+    std::atomic<transfer_event> wf = transfer_event::none; /* 主线程给工作线程的标志 */
 
     // 报文解析状态
     struct {
@@ -69,4 +71,6 @@ struct connection {
 
     connection(sock<tcp_connected, ip> &&stream, ip addr)
         :stream(std::move(stream)), addr(addr) {}
+
+    ~connection() { G::skips[this] = -1; }
 };

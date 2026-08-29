@@ -5,15 +5,16 @@
 #include "internal.hh"
 
 #include "io/utils.hh"
+#include <sys/stat.h>
 
 #include <filesystem>
-#include <sys/stat.h>
+#include <thread>
 
 template <typename T, typename... Args>
 void start_sync(connection &c, Args &&... args) {
     set_block(c.dstream);
-    T hdl(std::forward<Args>(args)...);
-    while (!hdl.handle(c)) {
+    T handler(std::forward<Args>(args)...);
+    while (!handler.handle(c)) {
         continue;
     }
 }
@@ -28,11 +29,8 @@ void start_worker(connection &c, Args... args) {
     });
 
     auto worker = [&c](Args... args) {
-        T handler(c);
-        while (true) {
-            if (worker_check_flag(c)) {
-                return;
-            }
+        T handler(args...);
+        while (c.wf.load() == transfer_event::none) {
             if (handler.handle_worker(c)) {
                 // 正常结束或者退出了
                 return;
@@ -47,7 +45,7 @@ void start_worker(connection &c, Args... args) {
 size_t format_list(const fs::directory_entry &st, iobuf<char> buf) {
     // TODO: 权限 大小 上次修改时间 文件名 ...
 
-    int sz = snprintf(buf.base, buf.len, "%s\n", st.path().filename().c_str());
+    int sz = snprintf(buf.base, buf.len, "%s\r\n", st.path().filename().c_str());
     if (sz < 0 || sz >= buf.len) return 0;
     return sz;
 }
@@ -60,7 +58,7 @@ class LIST_handler: public data_handler {
 public:
     LIST_handler(connection &c): it(c.dpath) {}
 
-    handler_poll_result operator()(connection &c) override {
+    handler_poll_result poll(connection &c) override {
         // 现在可写了，我们先准备发送剩余的数据
         // 如果暂时还没有要发送的数据，我们去解析和准备数据
         if (!off) {
@@ -93,11 +91,7 @@ public:
 };
 
 void do_LIST_transfer(connection &c) {
-    struct stat st;
-    if (::stat(c.dpath.c_str(), &st) == -1) {
-        THROW_LATEST;
-    }
-    size_t sz = st.st_size;
+    size_t sz = c.dst.st_size;
     // 先关闭读端
     c.dstream.shutdown(SHUT_RD);
 
@@ -117,5 +111,20 @@ void do_LIST_transfer(connection &c) {
     // 直接在这里处理
     else {
         start_sync<LIST_handler>(c, c);
+    }
+}
+
+void start_data_transfer(connection &c) {
+    respond<ftpd_code::transfer_open>(
+        c.stream, c.dpath.filename().c_str());
+    c.s = connection_state::in_transfer;
+
+    switch (c.dcmd) {
+        case data_commands::list:
+            do_LIST_transfer(c);
+            break;
+        case data_commands::retrieve:
+        case data_commands::store:
+            break;
     }
 }

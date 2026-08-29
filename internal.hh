@@ -1,10 +1,11 @@
 #pragma once
 
+#include "globals.hh"
 #include "types.hh"
 #include "message.hh"
-#include "io/utils.hh"
 
-#include <thread>
+#include <cerrno>
+#include <sys/stat.h>
 
 union epoll_data encode_ptr(handle_type type, connection *c) {
     if (type == control_acceptor) return { .u64 = 0 };
@@ -60,7 +61,7 @@ bool ensure_transferable(connection &c) {
 // assert ensure_transferable()
 // prepare_data_transfer()
 // [state: before_transfer]
-// await evloop <- abort_transfer_preparation()
+// await on_PORT_connected()/on_PASV_accepted()  <- abort_transfer_preparation()
 // start_data_transfer()
 // [state: in_transfer]
 // await evloop
@@ -102,11 +103,13 @@ void abort_transfer_preparation(connection &c) {
             break;
 
         case transfer_mode::passive:
+            G::skips[&c] |= 1 << handle_type::data_acceptor;
             c.dacceptor.close();
             break;
 
         case transfer_mode::port:
             if (c.s == connection_state::before_transfer) {
+                G::skips[&c] |= 1 << handle_type::data_connector;
                 c.dstream.close();
             }
             break;
@@ -120,7 +123,7 @@ void complete_data_transfer(connection &c, transfer_event e) {
     c.dstream.close();
 
     switch (e) {
-        case transfer_event::completed:
+        case transfer_event::none:
             respond<ftpd_code::transfer_ok>(c.stream);
             break;
         case transfer_event::error:
@@ -142,18 +145,6 @@ void complete_data_transfer(connection &c, transfer_event e) {
     }
 }
 
-// 工作线程处理消息
-// 返回 true 表示工作线程自己要退出了
-bool worker_check_flag(connection &c) {
-    switch (c.wf.load()) {
-        case transfer_event::destroy:
-        case transfer_event::aborted:
-            c.ef.set(efd::unit);
-            return true;
-    }
-    return false;
-}
-
 bool ensure_permission(connection &c, const fs::path &p) {
     // TODO: 完成权限解析
     // 逐级往上找，如果pi是某个allows项则允许，是某个disallows项则禁止
@@ -167,46 +158,45 @@ bool ensure_permission(connection &c, const fs::path &p) {
 // 3. 与给定文件类型（not_found/dir/file）是否匹配
 // 4. 文件是否忙
 // 如果提供了st指针，还会把读到的数据给调用者，避免再次系统调用
+// fs::status返回的信息实在太少，所以这里改成了平台的stat()
 bool ensure_target(
     connection &c, 
     const fs::path &target_path,
-    fs::file_type expected_type,
-    fs::file_status *status_out_p = nullptr,
-    bool follow_sym = true
+    mode_t expected_type, // S_IF...
+    struct stat *status_out_p = nullptr
 ) {
     if (!ensure_permission(c, target_path)) {
         return false;
     }
+    struct stat buf, *st = status_out_p ? status_out_p : &buf;
 
-    std::error_code ec;
-    fs::file_status status_buf,
-        *st = status_out_p ? status_out_p : &status_buf;
+    int _ = stat(target_path.c_str(), st);
 
-    *st = follow_sym
-        ? fs::status(target_path, ec)
-        : fs::symlink_status(target_path, ec);
-    bool match = expected_type == st->type();
-    if (!match && ec) {
+    bool match = (_ == -1 && errno == ENOENT)
+        ? expected_type == 0
+        : (st->st_mode & S_IFMT) == expected_type;
+
+    if (!match && errno) {
         respond<ftpd_code::action_fail, action_fail_variant::system_error>
-            (c.stream, strerror(ec.value()));
+            (c.stream, strerror(errno));
         return false;
     }
     // 现在要么没错误，要么匹配
     // 先看不匹配的场景
     if (!match) {
         switch (expected_type) {
-        case fs::file_type::not_found:
+        case 0:
             // MKD，STOR
             // 注意如果这个path中间不存在并不会进入这里，但在之后的处理会报错
             respond<ftpd_code::action_fail, 
                     action_fail_variant::already_exist>(c.stream);
             break;
-        case fs::file_type::directory:
+        case S_IFDIR:
             // RMD
             respond<ftpd_code::action_fail,
                     action_fail_variant::not_a_dir>(c.stream);
             break;
-        case fs::file_type::regular:
+        case S_IFREG:
             // DELE, RETR
             respond<ftpd_code::action_fail, 
                     action_fail_variant::not_a_file>(c.stream);
@@ -226,12 +216,12 @@ struct data_handler {
 
     virtual ~data_handler() = default;
 
-    virtual handler_poll_result operator() (connection &c) = 0;
+    virtual handler_poll_result poll(connection &c) = 0;
 
     bool handle(connection &c) {
-        switch ((*this)(c)) {
+        switch (poll(c)) {
             case handler_poll_result::complete:
-                complete_data_transfer(c, transfer_event::completed);
+                complete_data_transfer(c, transfer_event::none);
                 return true;
 
             case handler_poll_result::error:
@@ -244,14 +234,14 @@ struct data_handler {
     }
 
     bool handle_worker(connection &c) {
-        switch ((*this)(c)) {
+        switch (poll(c)) {
             case handler_poll_result::complete:
                 break;
             
             case handler_poll_result::error: {
                 // 发现问题，尝试设置错误
                 // 期望是completed（默认），如果发现主线程在刚刚已经设置为别的值则放弃
-                transfer_event expect = transfer_event::completed;
+                transfer_event expect = transfer_event::none;
                 c.wf.compare_exchange_strong(expect, transfer_event::error);
                 break;
             }

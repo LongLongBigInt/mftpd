@@ -35,10 +35,6 @@ PEM_result parse_and_eval_message(connection &c) {
     if (n <= 0) { // eof or error
         return should_close;
     }
-    // ready_to_close状态下读端已关闭，可能存在残留消息，需要忽略
-    if (c.s == connection_state::ready_to_close) {
-        return ok;
-    }
     end += n;
 
     int sep = -1, begin = 0;
@@ -71,7 +67,7 @@ PEM_result parse_and_eval_message(connection &c) {
     return ok;
 }
 
-void on_control_message(connection &c, std::unordered_set<connection *> &skips) {
+void on_control_message(connection &c) {
     switch (parse_and_eval_message(c)) {
         case ok:
             break;
@@ -85,9 +81,7 @@ void on_control_message(connection &c, std::unordered_set<connection *> &skips) 
                 // 因为error已经没意义了
                 c.wf.store(transfer_event::destroy);
             } else {    
-                // 防止同一批次稍后的连接或者worker有消息，我们在这里mask一下
-                skips.insert(&c);
-                // 不管当前状态是什么（dacceptor或者dconnector怎么样），析构函数总能正确处理
+                // 其余清理直接由析构函数进行
                 delete &c;
             }
             break;
@@ -104,39 +98,19 @@ void on_data_message(connection &c, uint32_t ev) {
     // 这里可能之前处理了abort命令，我们已经把dstream关闭了，这是同一批的残留
     // 这里我们看到dstream失效后直接忽略
     if (!c.dstream.valid()) return;
-
-    // TODO 可能delete c，需要skip
     c.handler->handle(c);
 }
 
-void on_worker_event(connection &c, std::unordered_set<connection *> &skips) {
+void on_worker_event(connection &c) {
     transfer_event ev = c.wf.load();
 
     if (ev == transfer_event::destroy) {
-        skips.insert(&c);
         delete &c;
         return;
     }
 
     c.ef.close();
-
-    // TODO 可能delete c，需要skip
     complete_data_transfer(c, ev);
-}
-
-void start_data_transfer(connection &c) {
-    respond<ftpd_code::transfer_open>(
-        c.stream, c.dpath.filename().c_str());
-    c.s = connection_state::in_transfer;
-
-    switch (c.dcmd) {
-        case data_commands::list:
-            do_LIST_transfer(c);
-            break;
-        case data_commands::retrieve:
-        case data_commands::store:
-            break;
-    }
 }
 
 void on_PASV_accepted(connection &c) {
@@ -201,12 +175,13 @@ int main(int argc, char const *argv[])
         encode_ptr(control_acceptor, nullptr) });
 
     while (true) {
-        std::unordered_set<connection *> skips;
+        G::skips.clear();
 
         for (auto [ev, data]: G::ep.wait()) {
             auto [type, connp] = decode_ptr(data);
 
-            if (!skips.empty() && skips.count(connp)) {
+            auto it = G::skips.find(connp);
+            if (it != G::skips.end() && (it->second & (1 << type))) {
                 continue;
             }
 
@@ -220,7 +195,7 @@ int main(int argc, char const *argv[])
 
             case handle_type::control_stream:
                 if (ev & epoll::in) {
-                    on_control_message(*connp, skips);
+                    on_control_message(*connp);
                 }
                 break;
             
@@ -242,7 +217,7 @@ int main(int argc, char const *argv[])
             
             case handle_type::worker_event:
                 if (ev & epoll::in) {
-                    on_worker_event(*connp, skips);
+                    on_worker_event(*connp);
                 }
                 break;
             }

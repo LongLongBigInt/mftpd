@@ -42,9 +42,8 @@ public:
     }
     void detach() { fd_ = invalid_handle; }
     int native_handle() { return fd_; }
-    void set_evloop(E *evloop) {
-        evloop_ = evloop;
-    }
+    void set_evloop(E *evloop) { evloop_ = evloop; }
+    E *evloop() { return evloop_; }
 };
 
 class epoll;

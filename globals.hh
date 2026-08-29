@@ -5,6 +5,8 @@
 #include "net/sockaddr.hh"
 
 #include "config.hh"
+#include <cstdint>
+#include <unordered_map>
 
 #define FTPD_MAX_MSG_LEN 4096
 #define FTPD_MAX_RES_LEN 4096
@@ -19,5 +21,6 @@ namespace G
 {
     config cfg;
     epoll ep;
+    std::unordered_map<void *, uint32_t> skips;
     sock<tcp_listening, ip> ctl;
 }
