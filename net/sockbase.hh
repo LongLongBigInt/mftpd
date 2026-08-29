@@ -4,7 +4,10 @@
 #include "../io/handle.hh"
 #include "../io/buf.hh"
 
+#include <algorithm>
+#include <cerrno>
 #include <sys/socket.h>
+#include <sys/types.h>
 #include <unistd.h>
 
 #include <tuple>
@@ -37,13 +40,33 @@ protected:
         if (_ == -1 && errno != EINPROGRESS) THROW_LATEST;
     }
 
+    static constexpr int permitted_errors[] = {
+        EAGAIN, EWOULDBLOCK, ECONNRESET, ETIMEDOUT, EINTR
+    };
+
     template <typename T>
     ssize_t recv_nothrow(iobuf<T> buf, int flags = 0) {
-        return ::recv(native_handle(), buf.base, buf.len, flags);
+        // 虽然是nothrow语义，这里只对容忍的错误放行；下同
+        ssize_t n = ::recv(native_handle(), buf.base, buf.len, flags);
+        if (n == -1) {
+            for (int e: permitted_errors) {
+                if (e == errno) return n;
+            }
+            THROW_LATEST;
+        }
+        return n;
     }
+
     template <typename T>
     ssize_t send_nothrow(iobuf<const T> buf, int flags = 0) {
-        return ::send(native_handle(), buf.base, buf.len, flags);
+        ssize_t n = ::send(native_handle(), buf.base, buf.len, flags);
+        if (n == -1) {
+            for (int e: permitted_errors) {
+                if (e == errno) return n;
+            }
+            THROW_LATEST;
+        }
+        return n;
     }
     template <typename T>
     size_t recv(iobuf<T> buf, int flags = 0) {

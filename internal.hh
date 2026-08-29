@@ -21,21 +21,22 @@ decode_ptr(union epoll_data data) {
 }
 
 bool ensure_auth(connection &c) {
-    if (c.s == connection_state::need_pass) {
-        respond<ftpd_code::bad_sequence>(c.stream);
-        return false;
-    }
-    if (c.s == connection_state::before_auth) {
-        respond<ftpd_code::unauth, 
+    switch (c.ss) {
+        case session_state::need_pass:
+            respond<ftpd_code::bad_sequence>(c.stream);
+            return false;
+        case session_state::before_auth:
+            respond<ftpd_code::unauth, 
                 unauth_variant::require_auth>(c.stream);
-        return false;
+            return false;
+        case session_state::auth:
+        default:
+            return true;
     }
-    return true;
 }
 
 bool ensure_idle(connection &c) {
-    if (c.s == connection_state::before_transfer ||
-        c.s == connection_state::in_transfer) {
+    if (c.ts != transfer_state::idle) {
         respond<ftpd_code::bad_sequence>(c.stream);
         return false;
     }
@@ -74,29 +75,29 @@ void prepare_data_transfer(
 ) {
     c.dcmd = cmd;
     c.dpath = std::move(path);
-    c.s = connection_state::before_transfer;
+    c.ts = transfer_state::before_transfer;
 
-    switch (c.m) {     
-    case transfer_mode::passive:
-        G::ep.add(c.dacceptor, {
-            epoll::in,
-            encode_ptr(handle_type::data_acceptor, &c)
-        });
-        break;
+    switch (c.m) {
+        case transfer_mode::passive:
+            G::ep.add(c.dacceptor, {
+                epoll::in,
+                encode_ptr(handle_type::data_acceptor, &c)
+            });
+            break;
 
-    case transfer_mode::port:
-        // TODO: 允许配置使用特定的ip连接
-        c.dstream = sock<tcp, ip>::create_nonblock()
-            .connect(c.daddr); // sock_base::connect()不会throw
-        G::ep.add(c.dstream, {
-            epoll::out,
-            encode_ptr(handle_type::data_connector, &c)
-        });
-        break;
+        case transfer_mode::port:
+            // TODO: 允许配置使用特定的ip连接
+            c.dstream = sock<tcp, ip>::create_nonblock()
+                .connect(c.daddr); // sock_base::connect()不会throw
+            G::ep.add(c.dstream, {
+                epoll::out,
+                encode_ptr(handle_type::data_connector, &c)
+            });
+            break;
     }
 }
 
-// 取消由pasv/port启动的端口；对于idle以前的状态是noop
+// 打断idle(set)/before_transfer状态，并设回idle(unset)
 void abort_transfer_preparation(connection &c) {
     switch (c.m) {
         case transfer_mode::unset:
@@ -108,12 +109,15 @@ void abort_transfer_preparation(connection &c) {
             break;
 
         case transfer_mode::port:
-            if (c.s == connection_state::before_transfer) {
+            if (c.ts == transfer_state::before_transfer) {
                 G::skips[&c] |= 1 << handle_type::data_connector;
                 c.dstream.close();
             }
             break;
     }
+    
+    c.m = transfer_mode::unset;
+    c.ts = transfer_state::idle;
 }
 
 // 同步结束传输，并发送消息
@@ -134,14 +138,11 @@ void complete_data_transfer(connection &c, transfer_event e) {
             break;
     }
 
-    if (c.s == connection_state::ready_to_close) {
-        if (c.detached) {
-            c.stream.detach();
-        }
+    if (c.closing) {
         delete &c;
     } else {
         c.m = transfer_mode::unset;
-        c.s = connection_state::idle;
+        c.ts = transfer_state::idle;
     }
 }
 
@@ -173,9 +174,8 @@ bool ensure_target(
     int _ = stat(target_path.c_str(), st),
         ec = _ == -1 ? errno : 0;
 
-    bool match = ec == ENOENT
-        ? expected_type == 0
-        : (st->st_mode & S_IFMT) == expected_type;
+    bool match = ec ? ec == ENOENT ? expected_type == 0 : false
+                    : (st->st_mode & S_IFMT) == expected_type;
 
     if (!match && ec) {
         respond<ftpd_code::action_fail, action_fail_variant::system_error>
@@ -230,6 +230,7 @@ struct data_handler {
                 return true;
 
             case handler_poll_result::pending:
+            default:
                 return false;
         }
     }

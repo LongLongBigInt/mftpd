@@ -35,7 +35,7 @@ public:
     }
     bool valid() { return fd_ != invalid_handle; }
     bool close() {
-        bool ok = ::close(fd_);
+        bool ok = ::close(fd_) == 0;
         detach();
         if (ok && evloop_) evloop_->dec();
         return ok;

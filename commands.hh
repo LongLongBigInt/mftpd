@@ -7,23 +7,25 @@
 #include "internal.hh"
 
 void do_USER(connection &c, const char *name) {
-    if (c.s > connection_state::need_pass) {
-        // 本用户重复USER视为已登录，否则不支持重新登录
+    if (c.ss == session_state::auth) {
+        // 本用户重复USER视为已登录（防止某些客户端重试）
+        // 否则不支持重新登录（连接中发送USER的语义有分歧：数据传输是否要断开？）
+        // 建议用户使用语义更明确的 (ABOR)+REIN+USER
         if (c.u["name"].Scalar() == name) {
             respond<ftpd_code::logged_in>(c.stream);
-            return;
+        } else {
+            respond<ftpd_code::invalid_argument,
+                    invalid_argument_variant::relogin>(c.stream);
         }
-        respond<ftpd_code::invalid_argument,
-                invalid_argument_variant::relogin>(c.stream);
         return;
     }
     c.u = G::cfg.find_user(name);
-    c.s = connection_state::need_pass;
+    c.ss = session_state::need_pass;
     respond<ftpd_code::require_pass>(c.stream, name);
 }
 
 void do_PASS(connection &c, const char *pass) {
-    if (c.s != connection_state::need_pass) {
+    if (c.ss != session_state::need_pass) {
         respond<ftpd_code::bad_sequence>(c.stream);
         return;
     }
@@ -35,12 +37,12 @@ void do_PASS(connection &c, const char *pass) {
     }
 
 pass_fail:
-    c.s = connection_state::before_auth;
+    c.ss = session_state::before_auth;
     respond<ftpd_code::unauth, unauth_variant::auth_fail>(c.stream);
     return;
 
 pass_success:
-    c.s = connection_state::idle;
+    c.ss = session_state::auth;
     c.wd = config::get_dir(c.u["home"]);
     if (c.wd.empty()) {
         c.wd = G::cfg.default_home();
@@ -234,14 +236,9 @@ void do_LIST(connection &c, const char *path) {
 }
 
 void do_ABOR(connection &c) {
-    if (c.s < connection_state::in_transfer) {   
+    if (c.ts != transfer_state::in_transfer) {
+        // 如果传输还没有完全建立，尽力而为中断
         abort_transfer_preparation(c);
-
-        c.m = transfer_mode::unset;
-        if (c.s > connection_state::idle) {
-            c.s = connection_state::idle;
-        }
-
         respond<ftpd_code::common_ok>(c.stream, "ABORT");
         return;
     }
@@ -259,45 +256,27 @@ void do_ABOR(connection &c) {
 }
 
 void do_REIN(connection &c) {
-    if (c.s < connection_state::in_transfer) {   
-        abort_transfer_preparation(c);
-        c.s = connection_state::before_auth;
-        c.m = transfer_mode::unset;
+    if (c.ts != transfer_state::in_transfer) {   
+        abort_transfer_preparation(c);      
     }
-
-    // 根据规范，如果数据传输还在，不应该中断它
-    // 这里我们创建一个新的connection用于新用户，转移原有连接
-    // 原有连接c.stream变成一个不在事件循环、不持有资源的视图
-    // 然后像QUIT一样，打上ready_to_close标签
-    // 当数据传输完毕后，complete_data_transfer会检查这个标记并释放它
-    else if (c.s == connection_state::in_transfer) {
-        auto &new_c = *new connection(std::move(c.stream), c.addr);
-
-        c.stream = sock<tcp_connected, ip>(new_c.stream.native_handle());
-        c.s = connection_state::ready_to_close;
-        c.detached = true;
-
-        // 新连接接管控制连接：其 stream 与旧连接同一 fd（仍注册在 epoll 中），
-        // 只需把注册的数据指针改指向 new_c。注意不能用 new_c.dstream（此刻无效）。
-        G::ep.mod(new_c.stream, { epoll::in,
-            encode_ptr(handle_type::control_stream, &new_c)});
-    }
-
+    c.ss = session_state::before_auth;
     // 接待新用户
     respond<ftpd_code::welcome>(c.stream);
 }
 
 bool do_QUIT(connection &c) {
     respond<ftpd_code::bye>(c.stream);
+    
     // 如果此时没有数据传输，可以直接close掉
-    if (c.s != connection_state::in_transfer) {
+    if (c.ts != transfer_state::in_transfer) {
         // 调用方随即会调用delete &c，这也将自动释放可能正在连接的pasv/port socket
         return true;
     }
+
     // 否则关闭读端，设置为准备关闭的标志
     c.stream.shutdown(SHUT_RD);
     G::ep.del(c.stream); // 避免触发EOF
-    c.s = connection_state::ready_to_close;
+    c.closing = true;
     return false;
 }
 

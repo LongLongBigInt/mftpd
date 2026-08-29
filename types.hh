@@ -14,14 +14,26 @@ enum handle_type {
     worker_event
 };
 
-enum connection_state {
+enum session_state {
     before_auth,
     need_pass,
-    idle,
-    before_transfer, // 调用了数据命令，但还没开始传输
-    in_transfer, // 传输正在进行中
-    ready_to_close,
+    auth
 };
+
+enum transfer_state {
+    idle,
+    before_transfer,
+    in_transfer
+};
+
+// enum connection_state {
+//     before_auth,
+//     need_pass,
+//     idle,
+//     before_transfer, // 调用了数据命令，但还没开始传输
+//     in_transfer, // 传输正在进行中
+//     ready_to_close,
+// };
 
 enum transfer_mode {
     unset, port, passive,
@@ -43,7 +55,7 @@ struct connection {
     // 控制连接
     sock<tcp_connected, ip> stream;
     ip addr;
-    bool detached = false;
+    bool closing = false;
 
     // 数据连接
     sock<tcp_connected, ip> dstream;
@@ -52,7 +64,8 @@ struct connection {
 
     // FTP 状态
     user_data_p u; /* 用户数据 */
-    connection_state s = before_auth; /* FTP 状态 */
+    session_state ss = session_state::before_auth;
+    transfer_state ts = transfer_state::idle;
     fs::path wd; /* 当前工作目录 */
     transfer_mode m = unset; /* 当前数据传输模式 */
     data_commands dcmd; /* 当前数据传输命令 */

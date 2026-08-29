@@ -33,7 +33,8 @@ PEM_result parse_and_eval_message(connection &c) {
 
     ssize_t n = c.stream.recv_nothrow<char>({buf + end, std::end(buf)});
     if (n <= 0) { // eof or error
-        return should_close;
+        // 尽管不太可能是EAGAIN，但这里还是给它显式处理了
+        return (n == -1 && errno == EAGAIN) ? ok : should_close;
     }
     end += n;
 
@@ -80,7 +81,7 @@ void on_control_message(connection &c) {
                 // 我们这里先关闭数据连接
                 c.stream.close();
                 c.wf.store(transfer_event::destroy);
-                c.ef.set(efd::unit);
+                c.dstream.shutdown(SHUT_RDWR);
             } else {
                 // 其余清理直接由析构函数进行
                 delete &c;
@@ -150,7 +151,7 @@ void on_PORT_connected(connection &c) {
             (c.stream, strerror(err));
 
     c.m = transfer_mode::unset;
-    c.s = connection_state::idle;
+    c.ts = transfer_state::idle;
 }
 
 int main(int argc, char const *argv[])
@@ -162,7 +163,7 @@ int main(int argc, char const *argv[])
 
     INFO("Config loaded from %s", conf_path);
 
-    G::ctl = sock<tcp, ip>::create()
+    G::ctl = sock<tcp, ip>::create_nonblock()
         .bind_reuse({ G::cfg.port(), G::cfg.host() })
         .listen(FTPD_BACKLOG);
         

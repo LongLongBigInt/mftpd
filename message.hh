@@ -1,7 +1,9 @@
 #pragma once
 
 #include "globals.hh"
+#include <cerrno>
 #include <netinet/in.h>
+#include <sys/socket.h>
 
 #include "net/sockaddr.hh"
 #include "net/tcpsock.hh"
@@ -108,7 +110,7 @@ FTPD_DESC<unauth, require_auth> =
     "Not logged in.";
 
 FTPD_DESC<invalid_argument, relogin> =
-    "Reauthentication not supported.";
+    "Not supported. Send REIN + USER for relogin";
 
 // 常规操作
 
@@ -178,9 +180,18 @@ void respond(sock<tcp_connected, ip> &stream, Args... args) {
     buf[off++] = '\n';
     while (send < off) {
         ssize_t n = stream.send_nothrow<char>({buf + send, buf + off});
-        if (n <= 0) {
+        if (n < 0) {
             // 出现错误
-            // 这里我们不处理，留给epoll::in的分支去做
+
+            // FTP协议规定客户端必须在收到上一条消息后才发送新消息
+            // 因此合法的连接在响应时缓冲区为空，不会阻塞
+            // 这里我们对轻微的违规（如一些USER+PASS串行化的客户端）不予追究
+            // 但如果发送缓冲区已经大到装不下了，将要阻塞，这里直接shutdown()
+            // 这将发送RST，并且触发epoll::error，留给epoll::in分支做
+            if (errno == EAGAIN) {
+                stream.shutdown(SHUT_RDWR);
+            }
+            // 其他错误，这里我们不处理，同样留给epoll::in的分支去做
             return;
         } 
         send += n;
