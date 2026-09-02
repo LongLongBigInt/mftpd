@@ -168,7 +168,7 @@ FTPD_DESC<transfer_fail, user_abort> =
     "Connection closed; transfer aborted by user.";
 
 FTPD_DESC<transfer_local_error> = 
-    "Requested action aborted; local error in processing";
+    "Requested action aborted; local error in processing.";
 
 FTPD_DESC<transfer_not_open, mode_not_set> = 
     "Can't open data connection; send PASV/PORT first.";

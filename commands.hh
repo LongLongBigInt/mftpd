@@ -5,7 +5,6 @@
 #include "types.hh"
 #include "message.hh"
 #include "internal.hh"
-#include <fcntl.h>
 
 void do_USER(connection &c, const char *name) {
     if (c.ss == session_state::auth) {

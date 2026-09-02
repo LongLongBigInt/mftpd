@@ -57,7 +57,7 @@ public:
             while (it != end) {
                 struct stat st;
                 // TODO: 使用 fstatat
-                if (stat(it->path().c_str(), &st) == -1) {
+                if (lstat(it->path().c_str(), &st) == -1) {
                     return handler_poll_result::local_err;
                 }
                 size_t n = format_list<char>(
@@ -109,7 +109,8 @@ void do_LIST_transfer(connection &c) {
             return;
         }
         size_t left = c.dstream.send_exact<char>({buf, n});
-        complete_data_transfer(c, left ? transfer_event::network_err : transfer_event::none);
+        complete_data_transfer(c, left ? 
+            transfer_event::network_err : transfer_event::none);
         return;
     }
 

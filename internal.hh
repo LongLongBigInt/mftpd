@@ -129,6 +129,7 @@ void complete_data_transfer(connection &c, transfer_event e) {
 
         case transfer_event::local_err:
             respond<ftpd_code::transfer_local_error>(c.stream);
+            break;
 
         case transfer_event::aborted:
             respond<ftpd_code::transfer_fail, 
