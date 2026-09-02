@@ -9,7 +9,7 @@
 
 void on_new_connection() {
     // 这一步在linux中不会抛出或阻塞，除非EMFILE
-    auto [conn, addr] = G::ctl.accept();
+    auto [conn, addr] = G::ctl.accept(SOCK_NONBLOCK);
 
     if (!G::cfg.ip_allowed(addr)) {
         return; // 或者发送RST
@@ -24,17 +24,13 @@ void on_new_connection() {
         encode_ptr(handle_type::control_stream, &c)});
 }
 
-enum PEM_result {
-    ok, should_close, message_oversize
-};
-
-PEM_result parse_and_eval_message(connection &c) {
+bool parse_and_eval_message(connection &c) {
     auto &[buf, end, skip] = c.parsing_state;
 
     ssize_t n = c.stream.recv_nothrow<char>({buf + end, std::end(buf)});
     if (n <= 0) { // eof or error
-        // 尽管不太可能是EAGAIN，但这里还是给它显式处理了
-        return (n == -1 && errno == EAGAIN) ? ok : should_close;
+        // 尽管不太可能是EAGAIN，但这里还是给它显式处理了（视为false继续）
+        return !(n == -1 && errno == EAGAIN);
     }
     end += n;
 
@@ -45,10 +41,13 @@ PEM_result parse_and_eval_message(connection &c) {
         }
         if (i > 0 && buf[i-1] == '\r' && buf[i] == '\n') {
             if (skip) {
+                respond<ftpd_code::syntax_error, 
+                        syntax_error_variant::message_too_long>
+                        (c.stream);
                 skip = false;
             } else {
                 if (cmd_dispatch(c, begin, sep, i-1)) {
-                    return should_close;
+                    return true;
                 }
             }
             begin = i + 1;
@@ -59,40 +58,31 @@ PEM_result parse_and_eval_message(connection &c) {
     if (begin == 0 && end == FTPD_MAX_MSG_LEN) {
         skip = true;
         end = 0;
-        return message_oversize;
     } else if (begin != 0) {
         end -= begin;
         memmove(buf, buf + begin, end);
     }
 
-    return ok;
+    return false;
 }
 
 void on_control_message(connection &c) {
-    switch (parse_and_eval_message(c)) {
-        case ok:
-            break;
-
-        case should_close:
-            if (c.ef.valid()) {
-                // 如果工作线程在负责数据传输，委托它进行异步销毁
-                // 如果是QUIT命令返回true导致should_close，此时是没有数据连接的
-                // 因此这个路径只在控制连接收到eof/error时才触发
-                // 我们这里先关闭数据连接
-                c.stream.close();
-                c.wf.store(transfer_event::destroy);
-                c.dstream.shutdown(SHUT_RDWR);
-            } else {
-                // 其余清理直接由析构函数进行
-                delete &c;
-            }
-            break;
-
-        case message_oversize:
-            respond<ftpd_code::syntax_error, 
-                    syntax_error_variant::message_too_long>
-                    (c.stream);
-            break;
+    // 需要退出
+    if (!parse_and_eval_message(c)) {
+        return; 
+    }
+    
+    if (c.ef.valid()) {
+        // 如果工作线程在负责数据传输，委托它进行异步销毁
+        // 如果是QUIT命令返回true导致should_close，此时是没有数据连接的
+        // 因此这个路径只在控制连接收到eof/error时才触发
+        // 我们这里先关闭数据连接
+        c.stream.close();
+        c.wf.store(transfer_event::destroy);
+        c.dstream.shutdown(SHUT_RDWR);
+    } else {
+        // 其余清理直接由析构函数进行
+        delete &c;
     }
 }
 
@@ -105,6 +95,13 @@ void on_data_message(connection &c, uint32_t ev) {
 
 void on_worker_event(connection &c) {
     transfer_event ev = c.wf.load();
+
+    // 注意在worker线程的ef.set()可能还没返回
+    // 这时efdwrite()系统调用会持有这个ef的引用
+    // 导致随即的ef.close()不会完整释放ef，ef仍一直处于可读的状态
+    // 这里我们显式将ef移出epoll
+    // ef会在worker调用完efdwrite()后自动释放
+    G::ep.del(c.ef);
 
     if (ev == transfer_event::destroy) {
         delete &c;
@@ -163,7 +160,7 @@ int main(int argc, char const *argv[])
 
     INFO("Config loaded from %s", conf_path);
 
-    G::ctl = sock<tcp, ip>::create_nonblock()
+    G::ctl = sock<tcp, ip>::create()
         .bind_reuse({ G::cfg.port(), G::cfg.host() })
         .listen(FTPD_BACKLOG);
         

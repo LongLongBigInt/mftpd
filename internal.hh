@@ -87,8 +87,21 @@ void prepare_data_transfer(
 
         case transfer_mode::port:
             // TODO: 允许配置使用特定的ip连接
-            c.dstream = sock<tcp, ip>::create_nonblock()
-                .connect(c.daddr); // sock_base::connect()不会throw
+            auto [ok, stream] = sock<tcp, ip>::create_nonblock()
+                .connect_nothrow(c.daddr);
+
+            // 这里只检查同步错误，异步错误留给后面sock.get_error()处理
+            if (!ok && errno != EINPROGRESS) {
+                respond<ftpd_code::transfer_not_open,
+                        transfer_not_open_variant::socket_error>
+                        (c.stream, strerror(errno));
+
+                c.m = transfer_mode::unset;
+                c.ts = transfer_state::idle;
+                return;
+            }
+
+            c.dstream = std::move(stream);
             G::ep.add(c.dstream, {
                 epoll::out,
                 encode_ptr(handle_type::data_connector, &c)
@@ -97,7 +110,42 @@ void prepare_data_transfer(
     }
 }
 
+// 同步结束传输，并发送消息
+// 注意此路径可能会导致connection析构（如果处于ready_to_close状态）
+void complete_data_transfer(connection &c, transfer_event e) {
+    c.handler.reset();
+    c.dstream.close();
+
+    switch (e) {
+        case transfer_event::none:
+            respond<ftpd_code::transfer_finish,
+                    transfer_finish_variant::transfer_ok>(c.stream);
+            break;
+
+        case transfer_event::network_err:
+            respond<ftpd_code::transfer_fail,
+                    transfer_fail_variant::network_error>(c.stream);
+            break;
+
+        case transfer_event::local_err:
+            respond<ftpd_code::transfer_local_error>(c.stream);
+
+        case transfer_event::aborted:
+            respond<ftpd_code::transfer_fail, 
+                    transfer_fail_variant::user_abort>(c.stream);
+            break;
+    }
+
+    if (c.closing) {
+        delete &c;
+    } else {
+        c.m = transfer_mode::unset;
+        c.ts = transfer_state::idle;
+    }
+}
+
 // 打断idle(set)/before_transfer状态，并设回idle(unset)
+// 如果在before_transfer状态还会完成发送425结束状态机
 void abort_transfer_preparation(connection &c) {
     switch (c.m) {
         case transfer_mode::unset:
@@ -120,38 +168,14 @@ void abort_transfer_preparation(connection &c) {
     c.ts = transfer_state::idle;
 }
 
-// 同步结束传输，并发送消息
-// 注意此路径可能会导致connection析构（如果处于ready_to_close状态）
-void complete_data_transfer(connection &c, transfer_event e) {
-    c.handler.reset();
-    c.dstream.close();
-
-    switch (e) {
-        case transfer_event::none:
-            respond<ftpd_code::transfer_ok>(c.stream);
-            break;
-        case transfer_event::error:
-            respond<ftpd_code::transfer_fail>(c.stream);
-            break;
-        case transfer_event::aborted:
-            respond<ftpd_code::user_abort>(c.stream);
-            break;
-    }
-
-    if (c.closing) {
-        delete &c;
-    } else {
-        c.m = transfer_mode::unset;
-        c.ts = transfer_state::idle;
-    }
-}
-
 bool ensure_permission(connection &c, const fs::path &p) {
-    // TODO: 完成权限解析
-    // 逐级往上找，如果pi是某个allows项则允许，是某个disallows项则禁止
-    // 如果不属于任何匹配结果则禁止
+    // TODO
     return true;
 }
+
+enum target_type {
+    file_only, dir_only, any_file, non_exist
+};
 
 // 检测给定的目标路径
 // 1. FTP 用户权限是否允许
@@ -163,7 +187,7 @@ bool ensure_permission(connection &c, const fs::path &p) {
 bool ensure_target(
     connection &c, 
     const fs::path &target_path,
-    mode_t expected_type, // S_IF...
+    target_type expected_type, // S_IF...
     struct stat *status_out_p = nullptr
 ) {
     if (!ensure_permission(c, target_path)) {
@@ -171,40 +195,31 @@ bool ensure_target(
     }
     struct stat buf, *st = status_out_p ? status_out_p : &buf;
 
-    int _ = stat(target_path.c_str(), st),
-        ec = _ == -1 ? errno : 0;
-
-    bool match = ec ? ec == ENOENT ? expected_type == 0 : false
-                    : (st->st_mode & S_IFMT) == expected_type;
-
-    if (!match && ec) {
-        respond<ftpd_code::action_fail, action_fail_variant::system_error>
-            (c.stream, strerror(ec));
-        return false;
-    }
-    // 现在要么没错误，要么匹配
-    // 先看不匹配的场景
-    if (!match) {
-        switch (expected_type) {
-        case 0:
-            // MKD，STOR
-            // 注意如果这个path中间不存在并不会进入这里，但在之后的处理会报错
+    bool ok = stat(target_path.c_str(), st) == 0;
+    
+    if (ok) {
+        if (expected_type == non_exist) {
             respond<ftpd_code::action_fail, 
                     action_fail_variant::already_exist>(c.stream);
-            break;
-        case S_IFDIR:
-            // RMD, LIST
-            respond<ftpd_code::action_fail,
-                    action_fail_variant::not_a_dir>(c.stream);
-            break;
-        case S_IFREG:
-            // DELE, RETR
+            return false; 
+        }
+        if (expected_type == file_only && !S_ISREG(st->st_mode)) {
             respond<ftpd_code::action_fail, 
                     action_fail_variant::not_a_file>(c.stream);
-            break;
+            return false;
         }
+        if (expected_type == dir_only && !S_ISDIR(st->st_mode)) {
+            respond<ftpd_code::action_fail,
+                    action_fail_variant::not_a_dir>(c.stream);
+            return false;
+        }
+    }
+    else if (!(errno == ENOENT && expected_type == non_exist)) {
+        respond<ftpd_code::action_fail,
+                action_fail_variant::system_error>(c.stream, strerror(errno));
         return false;
     }
+
     // TODO: 查看文件是否被占用
     return true;
 }
@@ -212,39 +227,51 @@ bool ensure_target(
 struct data_handler {
 
     enum class handler_poll_result {
-        complete, error, pending
+        complete, network_err, local_err, pending
     };
+    
+    static transfer_event result_mapping(handler_poll_result r) {
+        switch (r) {
+        case handler_poll_result::complete: return none;
+        case handler_poll_result::network_err: return network_err;
+        default:
+        case handler_poll_result::local_err: return local_err;
+        }
+    }
 
     virtual ~data_handler() = default;
 
     virtual handler_poll_result poll(connection &c) = 0;
 
     bool handle(connection &c) {
-        switch (poll(c)) {
-            case handler_poll_result::complete:
-                complete_data_transfer(c, transfer_event::none);
-                return true;
-
-            case handler_poll_result::error:
-                complete_data_transfer(c, transfer_event::error);
-                return true;
-
-            case handler_poll_result::pending:
-            default:
-                return false;
+        handler_poll_result result = poll(c);
+        if (result == handler_poll_result::pending) {
+            return false;
         }
+        complete_data_transfer(c, result_mapping(result));
+        return true;
     }
 
     bool handle_worker(connection &c) {
-        switch (poll(c)) {
+        transfer_event expect = transfer_event::none;
+
+        // 如果主线程已经设置标志了，我们直接退出
+        if (c.wf.load() != expect) {
+            c.ef.set(efd::unit);
+            return true;
+        }
+
+        // 否则我们进行poll()
+        // 如果主线程有通知会设wf并打断
+        switch (handler_poll_result result = poll(c)) {
             case handler_poll_result::complete:
                 break;
             
-            case handler_poll_result::error: {
+            case handler_poll_result::local_err:
+            case handler_poll_result::network_err: {
                 // 发现问题，尝试设置错误
                 // 期望是默认的none，如果发现主线程在刚刚已经设置为别的值则放弃
-                transfer_event expect = transfer_event::none;
-                c.wf.compare_exchange_strong(expect, transfer_event::error);
+                c.wf.compare_exchange_strong(expect, result_mapping(result));
                 break;
             }
 

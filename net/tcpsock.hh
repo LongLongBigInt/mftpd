@@ -1,5 +1,6 @@
 #pragma once
 #include "sockbase.hh"
+#include <tuple>
 
 template <typename Addr>
 class sock<proto_variant::tcp, Addr>: public sock_base {
@@ -27,6 +28,11 @@ public:
         sock_base::connect(addr);
         return std::move(*this);
     }
+    std::tuple<bool, sock<proto_variant::tcp_connected, Addr>>
+    connect_nothrow(Addr addr) && {
+        bool ok = sock_base::connect_nothrow(addr);
+        return { ok, sock<proto_variant::tcp_connected, Addr>{std::move(*this)} };
+    }
 };
 
 template <typename Addr>
@@ -43,6 +49,11 @@ public:
     sock<proto_variant::tcp_connected, Addr> connect(Addr addr) && {
         sock_base::connect(addr);
         return std::move(*this);
+    }
+    std::tuple<bool, sock<proto_variant::tcp_connected, Addr>>
+    connect_nothrow(Addr addr) && {
+        bool ok = sock_base::connect_nothrow(addr);
+        return { ok, sock<proto_variant::tcp_connected, Addr>{std::move(*this)} };
     }
     Addr addr() {
         return sock_base::addr<Addr>();
@@ -83,6 +94,7 @@ public:
     
     using sock_base::send;
     using sock_base::send_nothrow;
+    using sock_base::send_exact;
     using sock_base::recv;
     using sock_base::recv_nothrow;
     using sock_base::shutdown;

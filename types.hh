@@ -26,15 +26,6 @@ enum transfer_state {
     in_transfer
 };
 
-// enum connection_state {
-//     before_auth,
-//     need_pass,
-//     idle,
-//     before_transfer, // 调用了数据命令，但还没开始传输
-//     in_transfer, // 传输正在进行中
-//     ready_to_close,
-// };
-
 enum transfer_mode {
     unset, port, passive,
 };
@@ -44,7 +35,7 @@ enum data_commands {
 };
 
 enum transfer_event {
-    none, error, aborted, destroy
+    none, network_err, local_err, aborted, destroy
 };
 
 using user_data_p = YAML::Node;
@@ -73,7 +64,7 @@ struct connection {
     struct stat dst;
     std::unique_ptr<data_handler> handler;
     efd ef; /* 接收工作线程信息的eventfd */
-    std::atomic<transfer_event> wf = transfer_event::none; /* 主线程给工作线程的标志 */
+    std::atomic<transfer_event> wf; /* 主线程给工作线程的标志 */
 
     // 报文解析状态
     struct {

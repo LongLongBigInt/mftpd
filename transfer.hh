@@ -6,20 +6,12 @@
 #include "internal.hh"
 
 #include "io/utils.hh"
+#include <cstddef>
 #include <sys/stat.h>
 
 #include <filesystem>
 #include <system_error>
 #include <thread>
-
-template <typename T, typename... Args>
-void start_sync(connection &c, Args &&... args) {
-    set_block(c.dstream);
-    T handler(std::forward<Args>(args)...);
-    while (!handler.handle(c)) {
-        continue;
-    }
-}
 
 template <typename T, typename... Args>
 void start_worker(connection &c, Args... args) {
@@ -32,24 +24,21 @@ void start_worker(connection &c, Args... args) {
 
     auto worker = [&c](Args... args) {
         T handler(args...);
-        while (c.wf.load() == transfer_event::none) {
-            if (handler.handle_worker(c)) {
-                // 正常结束或者退出了
-                return;
-            }
+        while (!handler.handle_worker(c)) {
+            continue;
         }
-        c.ef.set(efd::unit);
     };
 
     std::thread(worker, args...).detach();
 }
 
 
-size_t format_list(const fs::directory_entry &st, iobuf<char> buf) {
+template <typename T>
+size_t format_list(const fs::path &path, const struct stat &st, iobuf<T> buf) {
     // TODO: 权限 大小 上次修改时间 文件名 ...
 
-    int sz = snprintf(buf.base, buf.len, "%s\r\n", st.path().filename().c_str());
-    if (sz < 0 || sz >= buf.len) return 0;
+    int sz = snprintf((char *) buf.base, buf.bytes(), "%s\r\n", path.filename().c_str());
+    if (sz < 0 || sz >= buf.bytes()) return 0;
     return sz;
 }
 
@@ -66,7 +55,15 @@ public:
         // 如果暂时还没有要发送的数据，我们去解析和准备数据
         if (!off) {
             while (it != end) {
-                size_t n = format_list(*it, {buf + off, std::end(buf)});
+                struct stat st;
+                // TODO: 使用 fstatat
+                if (stat(it->path().c_str(), &st) == -1) {
+                    return handler_poll_result::local_err;
+                }
+                size_t n = format_list<char>(
+                    it->path(), st,
+                    {buf + off, std::end(buf)}
+                );
                 // 缓冲区满了，我们先去发送了
                 if (!n) break;
                 // 还没满，我们继续
@@ -74,7 +71,7 @@ public:
                 std::error_code ec;
                 it.increment(ec);
                 if (ec) {
-                    return handler_poll_result::error;
+                    return handler_poll_result::local_err;
                 }
             }
         }
@@ -84,7 +81,7 @@ public:
             if (n == -1) {
                 return errno == EAGAIN 
                     ? handler_poll_result::pending
-                    : handler_poll_result::error;    
+                    : handler_poll_result::network_err;
             }
             nsend += n;
             if (nsend == off) {
@@ -98,42 +95,53 @@ public:
 };
 
 void do_LIST_transfer(connection &c) {
-    std::error_code ec;
-    fs::directory_iterator start(c.dpath, ec);
-
-    if (ec) {
-        complete_data_transfer(c, transfer_event::error);
-        return;
-    }
-
-    size_t sz = c.dst.st_size;
     
     // 先关闭读端
     c.dstream.shutdown(SHUT_RD);
 
+    // 如果不是目录（是单文件项），我们直接传输
+    if (!S_ISDIR(c.dst.st_mode)) {
+        set_block(c.dstream);
+        char buf[1024 * 10];
+        size_t n = format_list(c.dpath, c.dst, iobuf{buf});
+        if (!n) {
+            complete_data_transfer(c, transfer_event::local_err);
+            return;
+        }
+        size_t left = c.dstream.send_exact<char>({buf, n});
+        complete_data_transfer(c, left ? transfer_event::network_err : transfer_event::none);
+        return;
+    }
+
+    std::error_code ec;
+    fs::directory_iterator start(c.dpath, ec);
+
+    if (ec) {
+        complete_data_transfer(c, transfer_event::local_err);
+        return;
+    }
+
     // 超过32k，用单独的线程
-    if (sz > 32 * 1024) {
+    if (c.dst.st_size > 32 * 1024) {
         start_worker<LIST_handler>(c, start);
+        return;
     }
-    // 超过1k，在事件循环中处理
-    else if (sz > 1024) {
-        set_nonblock(c.dstream);
-        c.handler = std::make_unique<LIST_handler>(start);
-        G::ep.add(c.dstream, {
-            epoll::out, 
-            encode_ptr(handle_type::data_stream, &c) 
-        });
-    }
-    // 直接在这里处理
-    else {
-        start_sync<LIST_handler>(c, start);
-    }
+
+    // 否则，在事件循环中处理
+    set_nonblock(c.dstream);
+    c.handler = std::make_unique<LIST_handler>(start);
+    G::ep.add(c.dstream, {
+        epoll::out, 
+        encode_ptr(handle_type::data_stream, &c) 
+    });
 }
 
 void start_data_transfer(connection &c) {
     respond<ftpd_code::transfer_open>(
         c.stream, c.dpath.filename().c_str());
+
     c.ts = transfer_state::in_transfer;
+    c.wf.store(transfer_event::none);
 
     switch (c.dcmd) {
         case data_commands::list:

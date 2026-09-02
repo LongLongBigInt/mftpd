@@ -5,6 +5,7 @@
 #include "types.hh"
 #include "message.hh"
 #include "internal.hh"
+#include <fcntl.h>
 
 void do_USER(connection &c, const char *name) {
     if (c.ss == session_state::auth) {
@@ -85,7 +86,7 @@ void do_CWD(connection &c, const char *path) {
     if (!ensure_auth(c)) return;
 
     fs::path target = c.wd / path;
-    if (!ensure_target(c, target, S_IFDIR)) {
+    if (!ensure_target(c, target, target_type::dir_only)) {
         return;
     }
 
@@ -121,7 +122,7 @@ void do_unlink(connection &c, const char *path, bool is_regular) {
 
     fs::path target = c.wd / path;
 
-    if (!ensure_target(c, target, is_regular ? S_IFREG : S_IFDIR)) return;
+    if (!ensure_target(c, target, is_regular ? file_only : dir_only)) return;
 
     std::error_code ec;
     bool ok = fs::remove(target, ec);
@@ -129,7 +130,6 @@ void do_unlink(connection &c, const char *path, bool is_regular) {
         respond<ftpd_code::action_fail,
                 action_fail_variant::system_error>(c.stream, strerror(ec.value()));
     } else if (!ok) {
-        // FIX: 跨平台
         respond<ftpd_code::action_fail,
                 action_fail_variant::system_error>(c.stream, strerror(ENOENT));
     } else {
@@ -228,7 +228,7 @@ void do_LIST(connection &c, const char *path) {
     }
 
     const fs::path &target = path ? c.wd / path : c.wd;
-    if (!ensure_target(c, target, S_IFDIR, &c.dst)) {
+    if (!ensure_target(c, target, target_type::any_file, &c.dst)) {
         return;
     }
 
@@ -239,7 +239,8 @@ void do_ABOR(connection &c) {
     if (c.ts != transfer_state::in_transfer) {
         // 如果传输还没有完全建立，尽力而为中断
         abort_transfer_preparation(c);
-        respond<ftpd_code::common_ok>(c.stream, "ABORT");
+        respond<ftpd_code::transfer_finish, 
+                transfer_finish_variant::transfer_abort>(c.stream);
         return;
     }
 
@@ -256,20 +257,31 @@ void do_ABOR(connection &c) {
 }
 
 void do_REIN(connection &c) {
+    // 根据规范，REIN保持in_transfer状态的数据连接
+    // 对于before_transfer，这里我们就正常销毁
     if (c.ts != transfer_state::in_transfer) {   
-        abort_transfer_preparation(c);      
+        if (c.ts == transfer_state::before_transfer) {
+            respond<ftpd_code::transfer_not_open,
+                    transfer_not_open_variant::abort_by_user>(c.stream);
+        }
+        abort_transfer_preparation(c);
     }
     c.ss = session_state::before_auth;
+    
     // 接待新用户
     respond<ftpd_code::welcome>(c.stream);
 }
 
 bool do_QUIT(connection &c) {
+    if (c.ts == transfer_state::before_transfer) {
+        respond<ftpd_code::transfer_not_open,
+                transfer_not_open_variant::abort_by_user>(c.stream);
+    }
+
     respond<ftpd_code::bye>(c.stream);
     
     // 如果此时没有数据传输，可以直接close掉
     if (c.ts != transfer_state::in_transfer) {
-        // 调用方随即会调用delete &c，这也将自动释放可能正在连接的pasv/port socket
         return true;
     }
 

@@ -4,8 +4,8 @@
 #include "../io/handle.hh"
 #include "../io/buf.hh"
 
-#include <algorithm>
 #include <cerrno>
+#include <cstddef>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -32,22 +32,36 @@ protected:
         if (fd == -1) THROW_LATEST;
         return {fd, Addr::from_system(addr)};
     }
-    template <typename Addr> 
-    void connect(Addr addr) {
+
+    template <typename Addr>
+    bool connect_nothrow(Addr addr) {
         auto res = addr.to_system();
         int _ = ::connect(native_handle(), (struct sockaddr *)&res, sizeof res);
-        // 为原型实现方便在这里hack一下
-        if (_ == -1 && errno != EINPROGRESS) THROW_LATEST;
+        if (_ == 0) return true;
+        constexpr int permitted_errors[] = {
+            EINPROGRESS, ENETUNREACH, EINTR, ECONNREFUSED, ETIMEDOUT
+        };
+        for (int e: permitted_errors) {
+            if (e == errno) return false;
+        }
+        THROW_LATEST;
+    }
+
+    template <typename Addr> 
+    void connect(Addr addr) {
+        if (!connect_nothrow(addr)) {
+            THROW_LATEST;
+        }
     }
 
     static constexpr int permitted_errors[] = {
-        EAGAIN, EWOULDBLOCK, ECONNRESET, ETIMEDOUT, EINTR
+        EAGAIN, EWOULDBLOCK, ECONNRESET, ETIMEDOUT, EINTR, EPIPE
     };
 
     template <typename T>
     ssize_t recv_nothrow(iobuf<T> buf, int flags = 0) {
         // 虽然是nothrow语义，这里只对容忍的错误放行；下同
-        ssize_t n = ::recv(native_handle(), buf.base, buf.len, flags);
+        ssize_t n = ::recv(native_handle(), buf.base, buf.bytes(), flags);
         if (n == -1) {
             for (int e: permitted_errors) {
                 if (e == errno) return n;
@@ -58,8 +72,8 @@ protected:
     }
 
     template <typename T>
-    ssize_t send_nothrow(iobuf<const T> buf, int flags = 0) {
-        ssize_t n = ::send(native_handle(), buf.base, buf.len, flags);
+    ssize_t send_nothrow(iobuf<T> buf, int flags = 0) {
+        ssize_t n = ::send(native_handle(), buf.base, buf.bytes(), flags);
         if (n == -1) {
             for (int e: permitted_errors) {
                 if (e == errno) return n;
@@ -75,10 +89,23 @@ protected:
         return _;
     }
     template <typename T>
-    size_t send(iobuf<const T> buf, int flags = 0) {
+    size_t send(iobuf<T> buf, int flags = 0) {
         ssize_t _ = send_nothrow(buf, flags);
         if (_ < 0) THROW_LATEST;
         return _;
+    }
+
+    // 返回剩余待写入的字节数；0代表完全成功，出错返回非零值
+    template <typename T>
+    size_t send_exact(iobuf<T> buf, int flags = 0) {
+        while (buf.bytes() > 0) {
+            ssize_t n = send_nothrow(buf, flags);
+            if (n < 0) {
+                return buf.bytes();
+            }
+            buf.base = (T *) ((char *) buf.base + n);
+        }
+        return 0;
     }
 
     template <typename T>
