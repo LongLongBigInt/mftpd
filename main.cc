@@ -8,17 +8,19 @@
 #include <csignal>
 
 void on_new_connection() {
-    // 这一步在linux中不会抛出或阻塞，除非EMFILE
     auto [conn, addr] = G::ctl.accept(SOCK_NONBLOCK);
 
     if (!G::cfg.ip_allowed(addr)) {
         return; // 或者发送RST
     }
 
-    DEBUG("New connection from %s", addr.to_string().c_str());
+    if (!G::cfg.ip_acceptable(addr)) {
+        respond<ftpd_code::service_not_available>(conn);
+        return;
+    }
 
     auto &c = *new connection(std::move(conn), addr);
-    respond<ftpd_code::welcome>(c.stream);
+    respond<ftpd_code::welcome>(c.stream, G::cfg.welcome_message);
 
     G::ep.add(c.stream, { epoll::in, 
         encode_ptr(handle_type::control_stream, &c)});
@@ -29,6 +31,12 @@ bool parse_and_eval_message(connection &c) {
 
     ssize_t n = c.stream.recv_nothrow<char>({buf + end, std::end(buf)});
     if (n <= 0) { // eof or error
+        if (n == 0) {
+            DEBUG("Connection %d: EOF", c.stream.native_handle());
+        } else {
+            DEBUG("Connection %d: %s", 
+                c.stream.native_handle(), strerror(errno));
+        }
         // 尽管不太可能是EAGAIN，但这里还是给它显式处理了（视为false继续）
         return !(n == -1 && errno == EAGAIN);
     }
@@ -42,8 +50,7 @@ bool parse_and_eval_message(connection &c) {
         if (i > 0 && buf[i-1] == '\r' && buf[i] == '\n') {
             if (skip) {
                 respond<ftpd_code::syntax_error, 
-                        syntax_error_variant::message_too_long>
-                        (c.stream);
+                        syntax_error_variant::message_too_long>(c.stream);
                 skip = false;
             } else {
                 if (cmd_dispatch(c, begin, sep, i-1)) {
@@ -67,7 +74,6 @@ bool parse_and_eval_message(connection &c) {
 }
 
 void on_control_message(connection &c) {
-    // 需要退出
     if (!parse_and_eval_message(c)) {
         return; 
     }
@@ -87,9 +93,6 @@ void on_control_message(connection &c) {
 }
 
 void on_data_message(connection &c, uint32_t ev) {
-    // 这里可能之前处理了abort命令，我们已经把dstream关闭了，这是同一批的残留
-    // 这里我们看到dstream失效后直接忽略
-    if (!c.dstream.valid()) return;
     c.handler->handle(c);
 }
 
@@ -154,14 +157,15 @@ void on_PORT_connected(connection &c) {
 int main(int argc, char const *argv[])
 {
     signal(SIGPIPE, SIG_IGN);
+    signal(SIGXFSZ, SIG_IGN);
 
     const char *conf_path = "config.yaml.test";
     G::cfg.load(conf_path);
 
     INFO("Config loaded from %s", conf_path);
 
-    G::ctl = sock<tcp, ip>::create()
-        .bind_reuse({ G::cfg.port(), G::cfg.host() })
+    G::ctl = sock<tcp, ip>::create_nonblock()
+        .bind_reuse({ G::cfg.port, G::cfg.host })
         .listen(FTPD_BACKLOG);
         
     INFO("Service listening on %s", G::ctl.addr().to_string().c_str());

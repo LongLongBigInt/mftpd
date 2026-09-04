@@ -138,9 +138,12 @@ protected:
         return Addr::from_system(addr);
     }
 
-    void shutdown(int how) {
+    bool shutdown(int how) {
         int _ = ::shutdown(native_handle(), how);
-        if (_ == -1) THROW_LATEST;
+        if (_ == 0) return true;
+        // 例如收到了RST
+        else if (errno == ENOTCONN) return false;
+        THROW_LATEST;
     }
 
 public:

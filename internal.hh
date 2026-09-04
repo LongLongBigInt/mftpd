@@ -86,8 +86,9 @@ void prepare_data_transfer(
             break;
 
         case transfer_mode::port:
-            // TODO: 允许配置使用特定的ip连接
             auto [ok, stream] = sock<tcp, ip>::create_nonblock()
+                // 使用控制连接相同的ip
+                .bind({0, c.laddr.addr})
                 .connect_nothrow(c.daddr);
 
             // 这里只检查同步错误，异步错误留给后面sock.get_error()处理
@@ -191,12 +192,13 @@ bool ensure_target(
     target_type expected_type, // S_IF...
     struct stat *status_out_p = nullptr
 ) {
-    if (!ensure_permission(c, target_path)) {
+    fs::path real_target = (c.home / c.wd).lexically_normal();
+    if (!ensure_permission(c, real_target)) {
         return false;
     }
     struct stat buf, *st = status_out_p ? status_out_p : &buf;
 
-    bool ok = stat(target_path.c_str(), st) == 0;
+    bool ok = stat(real_target.c_str(), st) == 0;
     
     if (ok) {
         if (expected_type == non_exist) {
@@ -225,28 +227,28 @@ bool ensure_target(
     return true;
 }
 
-struct data_handler {
+struct transfer_handler {
 
-    enum class handler_poll_result {
-        complete, network_err, local_err, pending
+    enum class poll_result {
+        pending, complete, network_err, local_err
     };
     
-    static transfer_event result_mapping(handler_poll_result r) {
+    static transfer_event result_mapping(poll_result r) {
         switch (r) {
-        case handler_poll_result::complete: return none;
-        case handler_poll_result::network_err: return network_err;
+        case poll_result::complete: return none;
+        case poll_result::network_err: return network_err;
         default:
-        case handler_poll_result::local_err: return local_err;
+        case poll_result::local_err: return local_err;
         }
     }
 
-    virtual ~data_handler() = default;
+    virtual ~transfer_handler() = default;
 
-    virtual handler_poll_result poll(connection &c) = 0;
+    virtual poll_result poll(connection &c) = 0;
 
     bool handle(connection &c) {
-        handler_poll_result result = poll(c);
-        if (result == handler_poll_result::pending) {
+        poll_result result = poll(c);
+        if (result == poll_result::pending) {
             return false;
         }
         complete_data_transfer(c, result_mapping(result));
@@ -264,19 +266,19 @@ struct data_handler {
 
         // 否则我们进行poll()
         // 如果主线程有通知会设wf并打断
-        switch (handler_poll_result result = poll(c)) {
-            case handler_poll_result::complete:
+        switch (poll_result result = poll(c)) {
+            case poll_result::complete:
                 break;
             
-            case handler_poll_result::local_err:
-            case handler_poll_result::network_err: {
+            case poll_result::local_err:
+            case poll_result::network_err: {
                 // 发现问题，尝试设置错误
                 // 期望是默认的none，如果发现主线程在刚刚已经设置为别的值则放弃
                 c.wf.compare_exchange_strong(expect, result_mapping(result));
                 break;
             }
 
-            case handler_poll_result::pending:
+            case poll_result::pending:
                 return false;
         }
 

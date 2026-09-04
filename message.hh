@@ -20,6 +20,7 @@ enum ftpd_code {
     action_ok = 250,
     printdir = 257,
     require_pass = 331,
+    service_not_available = 421,
     transfer_not_open = 425,
     transfer_fail = 426,
     busy = 450,
@@ -85,10 +86,13 @@ template <> constexpr const char *description_of
 // 问候
 
 FTPD_DESC<welcome> = 
-    "Service ready for new user.";
+    "%s";
 
 FTPD_DESC<bye> = 
-    "Bye.";
+    "%s";
+
+FTPD_DESC<service_not_available> =
+    "Service not available, closing control connection.";
 
 // 语法错误
 

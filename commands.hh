@@ -43,53 +43,51 @@ pass_fail:
 
 pass_success:
     c.ss = session_state::auth;
-    c.wd = config::get_dir(c.u["home"]);
-    if (c.wd.empty()) {
-        c.wd = G::cfg.default_home();
+    if (!config::get_dir(c.u["home"], c.home)) {
+        c.home = G::cfg.default_home;
     }
     respond<ftpd_code::logged_in>(c.stream);
+
+    DEBUG("Connection %d: User %s logged in",
+        c.stream.native_handle(), c.u["name"].Scalar().c_str());
 }
 
-template <printdir_variant v>
-void print_escaped_path(connection &c, const fs::path &formal_path) {
-    const char *str = formal_path.c_str();
-
-    auto escape = [](char *dest, const char *src) {
+std::string _get_escaped_path(
+    const char *formal_path, 
+    const char *first_quote
+) {
+    std::string res(formal_path, first_quote);
+    const char *cur = first_quote;
+    while (*cur) {
         const char quote = '"';
-        int i = 0, j = 0;
-        while (src[i]) {
-            if ((dest[j++] = src[i++]) == quote) {
-                dest[j++] = quote;
-            } 
+        res.push_back(*cur);
+        if (*cur == quote) {
+            res.push_back(*cur);
         }
-        dest[j] = '\0';
-    };
-
-    if (strchr(str, '"')) {
-        std::vector<char> buf(2 * strlen(str));
-        escape(buf.data(), str);
-        respond<ftpd_code::printdir, v>(c.stream, buf.data());
-    } else {
-        respond<ftpd_code::printdir, v>(c.stream, str);
+        ++cur;
     }
+    return res;
 }
+
+#define get_escape_path(path, first_quote) \
+(first_quote ? path : _get_escaped_path(path, first_quote).c_str())
 
 void do_PWD(connection &c) {
     if (!ensure_auth(c)) return;
 
-    print_escaped_path<printdir_variant::pwd>
-        (c, c.wd.lexically_normal());
+    const char *path = c.wd.c_str(), *quote = strchr(path, '"');
+    respond<ftpd_code::printdir, printdir_variant::pwd>
+        (c.stream, get_escape_path(path, quote));
 }
 
 void do_CWD(connection &c, const char *path) {
     if (!ensure_auth(c)) return;
 
-    fs::path target = c.wd / path;
+    fs::path target = (c.wd / path).lexically_normal();
     if (!ensure_target(c, target, target_type::dir_only)) {
         return;
     }
 
-    // TODO: 如果超长，lexically_normal整理一下
     c.wd = std::move(target);
     respond<ftpd_code::action_ok>(c.stream);
 }
@@ -97,22 +95,23 @@ void do_CWD(connection &c, const char *path) {
 void do_MKD(connection &c, const char *path) {
     if (!ensure_auth(c)) return;
 
-    fs::path target = c.wd / path;
-
-    // 这里省一次ensure_target，直接调用require_permission验证
-    if (!ensure_permission(c, target)) return;
+    fs::path target = (c.wd / path).lexically_normal();
+    if (!ensure_target(c, target, target_type::dir_only)) {
+        return;
+    }
 
     std::error_code ec;
     bool ok = fs::create_directory(target, ec);
     if (ec) {
-        respond<ftpd_code::action_fail,
-                action_fail_variant::system_error>(c.stream, strerror(ec.value()));
+        respond<ftpd_code::action_fail, action_fail_variant::system_error>
+            (c.stream, strerror(ec.value()));
     } else if (!ok) {
-        // 目录已存在ec会被清空，会进入这里；fs::remove()也类似
-        respond<ftpd_code::action_fail, 
-                action_fail_variant::already_exist>(c.stream);
+        respond<ftpd_code::action_fail, action_fail_variant::already_exist>
+            (c.stream);
     } else {
-        print_escaped_path<printdir_variant::mkd>(c, target);
+        const char *path = target.c_str(), *quote = strchr(path, '"');
+        respond<ftpd_code::printdir, printdir_variant::mkd>
+            (c.stream, get_escape_path(path, quote));
     }
 }
 
@@ -120,17 +119,18 @@ void do_unlink(connection &c, const char *path, bool is_regular) {
     if (!ensure_auth(c)) return;
 
     fs::path target = c.wd / path;
-
-    if (!ensure_target(c, target, is_regular ? file_only : dir_only)) return;
+    if (!ensure_target(c, target, is_regular ? file_only : dir_only)) {
+        return;
+    }
 
     std::error_code ec;
     bool ok = fs::remove(target, ec);
     if (ec) {
-        respond<ftpd_code::action_fail,
-                action_fail_variant::system_error>(c.stream, strerror(ec.value()));
+        respond<ftpd_code::action_fail, action_fail_variant::system_error>
+            (c.stream, strerror(ec.value()));
     } else if (!ok) {
-        respond<ftpd_code::action_fail,
-                action_fail_variant::system_error>(c.stream, strerror(ENOENT));
+        respond<ftpd_code::action_fail, action_fail_variant::system_error>
+            (c.stream, strerror(ENOENT));
     } else {
         respond<ftpd_code::action_ok>(c.stream);
     }
@@ -191,7 +191,11 @@ void do_PORT(connection &c, const char *addrstr) {
         return;
     }
 
-    // TODO: 检查ip是否允许
+    // TODO: 检查ip是否允许，这里先限制为必须是控制连接同ip
+    if (addr.addr != c.addr.addr) {
+        respond<ftpd_code::invalid_argument>(c.stream);
+        return;
+    }
 
     abort_transfer_preparation(c);
     c.daddr = addr;
@@ -206,10 +210,9 @@ void do_PASV(connection &c) {
     
     abort_transfer_preparation(c);
 
-    // TODO: 在限制的端口范围和ip中挑选一个
-    // 这里我们先直接使用系统给定的端口
+    // TODO: 固定的pasv-port/pasv-ip绑定可能抛异常
     c.dacceptor = sock<tcp, ip>::create()
-        .bind_reuse({0, G::cfg.host()})
+        .bind_reuse({G::cfg.pasv_port, G::cfg.pasv_ip})
         .listen(FTPD_BACKLOG);
     c.daddr = c.dacceptor.addr();
     c.m = transfer_mode::passive;
@@ -250,7 +253,8 @@ void do_ABOR(connection &c) {
         // 同时shutdown()打断阻塞中的socket
         c.dstream.shutdown(SHUT_RDWR);
     } else {
-        // 是事件循环，直接操作
+        // 是事件循环，直接操作；先设置mask
+        G::skips[&c] |= 1 << handle_type::data_stream;
         complete_data_transfer(c, transfer_event::aborted);
     }
 }
@@ -268,7 +272,7 @@ void do_REIN(connection &c) {
     c.ss = session_state::before_auth;
     
     // 接待新用户
-    respond<ftpd_code::welcome>(c.stream);
+    respond<ftpd_code::welcome>(c.stream, G::cfg.welcome_message);
 }
 
 bool do_QUIT(connection &c) {
@@ -277,7 +281,7 @@ bool do_QUIT(connection &c) {
                 transfer_not_open_variant::abort_by_user>(c.stream);
     }
 
-    respond<ftpd_code::bye>(c.stream);
+    respond<ftpd_code::bye>(c.stream, G::cfg.bye_message);
     
     // 如果此时没有数据传输，可以直接close掉
     if (c.ts != transfer_state::in_transfer) {
@@ -302,6 +306,11 @@ bool cmd_dispatch(connection &c, int begin, int sep, int term) {
     // 为了方便，我们在此处直接设置NUL
     // 让后续命令Handler能接收到标准C字符串
     cmd[cmd_len] = arg[arg_len] = '\0'; // 如果没有arg_len相当于设置cmd[cmd_len+1]即\n上
+    
+    DEBUG("Connection %d: handling ('%s', '%s')",
+        c.stream.native_handle(), 
+        cmd_len ? cmd : "[NULL]", 
+        arg_len ? arg : "[NULL]");
 
     auto cmd_is = [&](const char *c) {
         return strcasecmp(c, cmd) == 0;

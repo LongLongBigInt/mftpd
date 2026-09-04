@@ -40,12 +40,37 @@ enum transfer_event {
 
 using user_data_p = YAML::Node;
 
-struct data_handler;
+struct connection;
+union epoll_data encode_ptr(handle_type type, connection *c);
+
+struct transfer_handler;
+
+struct rate_limiter {
+    in_addr_t ip;
+    rate_limiter(in_addr_t ip): ip(ip) {
+        if (++G::connections >= G::cfg.max_connections) {
+            // 暂时停止接收新连接
+            G::ep.del(G::ctl);
+            G::skips[nullptr] = -1; 
+        }
+        // ip的拒绝在接收控制连接那里进行
+        ++G::ip_connections[ip];
+    }
+    ~rate_limiter() {
+        const int delta = 10;
+        int gc = --G::connections;
+        if (!G::ctl.evloop() && gc < G::cfg.max_connections - delta) {
+            G::ep.add(G::ctl, { epoll::in, 
+                encode_ptr(control_acceptor, nullptr) });
+        }
+        --G::ip_connections[ip];
+    }
+};
 
 struct connection {
     // 控制连接
     sock<tcp_connected, ip> stream;
-    ip addr;
+    ip addr, laddr;
     bool closing = false;
 
     // 数据连接
@@ -57,12 +82,13 @@ struct connection {
     user_data_p u; /* 用户数据 */
     session_state ss = session_state::before_auth;
     transfer_state ts = transfer_state::idle;
+    fs::path home;
     fs::path wd; /* 当前工作目录 */
     transfer_mode m = unset; /* 当前数据传输模式 */
     data_commands dcmd; /* 当前数据传输命令 */
     fs::path dpath; /* 当前数据传输路径 */
     struct stat dst;
-    std::unique_ptr<data_handler> handler;
+    std::unique_ptr<transfer_handler> handler;
     efd ef; /* 接收工作线程信息的eventfd */
     std::atomic<transfer_event> wf; /* 主线程给工作线程的标志 */
 
@@ -73,8 +99,20 @@ struct connection {
         bool skip = false;
     } parsing_state;
 
-    connection(sock<tcp_connected, ip> &&stream, ip addr)
-        :stream(std::move(stream)), addr(addr) {}
+    rate_limiter rl;
 
-    ~connection() { G::skips[this] = -1; }
+    connection(sock<tcp_connected, ip> &&stream, ip addr)
+        :stream(std::move(stream)), addr(addr), rl(addr.addr)
+    {
+        laddr = this->stream.addr();
+        DEBUG("Connection %d: accepted peer %s on %s",
+            this->stream.native_handle(), 
+            laddr.to_string().c_str(), 
+            addr.to_string().c_str());
+    }
+
+    ~connection() {
+        G::skips[this] = -1;
+        DEBUG("Connection %d: closing", stream.native_handle());
+    }
 };

@@ -42,7 +42,7 @@ size_t format_list(const fs::path &path, const struct stat &st, iobuf<T> buf) {
     return sz;
 }
 
-class LIST_handler: public data_handler {
+class LIST_handler: public transfer_handler {
     char buf[32 * 1024];
     size_t nsend = 0, off = 0;
     fs::directory_iterator it, end;
@@ -50,7 +50,7 @@ class LIST_handler: public data_handler {
 public:
     LIST_handler(fs::directory_iterator start): it(start) {}
 
-    handler_poll_result poll(connection &c) override {
+    poll_result poll(connection &c) override {
         // 现在可写了，我们先准备发送剩余的数据
         // 如果暂时还没有要发送的数据，我们去解析和准备数据
         if (!off) {
@@ -58,7 +58,7 @@ public:
                 struct stat st;
                 // TODO: 使用 fstatat
                 if (lstat(it->path().c_str(), &st) == -1) {
-                    return handler_poll_result::local_err;
+                    return poll_result::local_err;
                 }
                 size_t n = format_list<char>(
                     it->path(), st,
@@ -71,7 +71,7 @@ public:
                 std::error_code ec;
                 it.increment(ec);
                 if (ec) {
-                    return handler_poll_result::local_err;
+                    return poll_result::local_err;
                 }
             }
         }
@@ -80,8 +80,8 @@ public:
             ssize_t n = c.dstream.send_nothrow<char>({buf + nsend, buf + off});
             if (n == -1) {
                 return errno == EAGAIN 
-                    ? handler_poll_result::pending
-                    : handler_poll_result::network_err;
+                    ? poll_result::pending
+                    : poll_result::network_err;
             }
             nsend += n;
             if (nsend == off) {
@@ -89,8 +89,8 @@ public:
             }
         }
         return it == end && off == 0
-            ? handler_poll_result::complete 
-            : handler_poll_result::pending;
+            ? poll_result::complete 
+            : poll_result::pending;
     }
 };
 

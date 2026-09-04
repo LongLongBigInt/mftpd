@@ -1,9 +1,25 @@
 host: 127.0.0.1
 port: 2121
+
+# welcome-message: hello!
+# bye-message: see you
+
+allowed-ips:
+  - 127.0.0.1
+  - 192.168.1.0/24
+
+# pasv-ip: 127.0.0.1
+# pasv-port: 20
+
+# max-connections: 1000
+# max-connections-per-ip: 10
+
 default-home: /home
+
 users:
   - name: test
     pass: 123456
     home: /home/scutech
+
   - name: visitor
   
