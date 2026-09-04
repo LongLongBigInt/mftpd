@@ -1,19 +1,17 @@
 #pragma once
 
 #include "net/sockaddr.hh"
+#include "globals.hh"
+
 #include <cstdlib>
 #include <cstring>
-#include <filesystem>
 #include <utility>
 #include <vector>
+#include <string_view>
 
 #include <yaml-cpp/yaml.h>
 
-#define FTPD_MAX_MSG_LEN 4096
-#define FTPD_MAX_RES_LEN 4096
-#define FTPD_BACKLOG 100
 #define FTPD_DEFAULT_HOME_PATH "/"
-#define FTPD_DEFAULT_CONFIG_PATH "/etc/ftpd/config.yaml"
 #define FTPD_DEFAULT_HOST ip::loopback
 #define FTPD_DEFAULT_CONTROL_PORT 21
 #define FTPD_DEFAULT_MAX_CONNECTIONS 4096
@@ -25,18 +23,6 @@
 #define FTPD_DEFAULT_BYE_MESSAGE \
     "Bye."
 
-#ifdef FTPD_ENABLE_LOG
-    #define DEBUG(FMT, ...) printf("[DEBUG] " FMT "\n", __VA_ARGS__)
-    #define INFO(FMT, ...) printf("[INFO] " FMT "\n", __VA_ARGS__)
-    #define WARNING(FMT, ...) fprintf(stderr, "[WARNING] " FMT "\n", __VA_ARGS__)
-#else
-    #define DEBUG(...)
-    #define INFO(...)
-    #define WARNING(...)
-#endif
-
-namespace fs = std::filesystem;
-
 bool str2ip(const char *str, in_addr_t &addr) {
     in_addr a;
     bool ok = inet_aton(str, &a) == 1;
@@ -45,6 +31,7 @@ bool str2ip(const char *str, in_addr_t &addr) {
     return true;
 }
 
+// 这里修改了str；无所谓
 bool parse_CIDR(char *CIDR_str, in_addr_t &addr, in_addr_t &mask) {
     char *slash = (char *) strchr(CIDR_str, '/');
     if (slash) *slash = '\0';
@@ -55,6 +42,11 @@ bool parse_CIDR(char *CIDR_str, in_addr_t &addr, in_addr_t &mask) {
     return true;
 }
 
+struct user_info {
+    std::string_view name, pass;
+    fs::path home;
+};
+
 struct config
 {
     in_addr_t host = 
@@ -64,8 +56,6 @@ struct config
         FTPD_DEFAULT_CONTROL_PORT;
 
     in_addr_t pasv_ip;
-
-    in_port_t pasv_port = 0;
 
     int max_connections = 
         FTPD_DEFAULT_MAX_CONNECTIONS;
@@ -94,7 +84,6 @@ struct config
         load_value("welcome-message", welcome_message);
         load_value("bye-message", bye_message);
         if (!load_ip_value("pasv-ip", pasv_ip)) pasv_ip = host;
-        load_value("pasv-port", pasv_port);
         load_value("max-connections", max_connections);
         load_value("max-connections-per-ip", max_connections_per_ip);
         load_value("idle-timeout", idle_timeout);
@@ -102,13 +91,19 @@ struct config
         load_allowed_ip();
     }
 
-    YAML::Node find_user(const char *name) {
+    user_info get_user(const char *name) {
+        user_info u{};
         for (YAML::Node node: root["users"]) {
             if (node["name"].Scalar() == name) {
-                return node;
+                u.name = node["name"].Scalar().c_str();
+                u.pass = node["pass"].Scalar().c_str();
+                if (!get_dir(node["home"], u.home)) {
+                    u.home = default_home;
+                }
+                break;
             }
         }
-        return YAML::Node(YAML::NodeType::Undefined);
+        return u;
     }
 
     bool ip_allowed(ip addr) {
@@ -120,8 +115,8 @@ struct config
     }
 
     bool ip_acceptable(ip addr) {
-        return max_connections_per_ip != 0 && 
-            G::ip_connections[addr.addr] >= max_connections_per_ip;
+        return max_connections_per_ip == 0 ||
+            G::ip_connections[addr.addr] < max_connections_per_ip;
     }
 
     static bool get_dir(YAML::Node node, fs::path &path) {
@@ -141,7 +136,7 @@ private:
 
     bool load_value_(const char *key, auto &dest, auto &&try_load) {
         YAML::Node n = root[key];
-        if (!n) return true;
+        if (!n) return false;
         if (try_load(n, dest)) return true;
         WARNING("config: bad '%s' value '%s'", key, n.Scalar().c_str());
         return false;
@@ -153,7 +148,10 @@ private:
     }
 
     bool load_value(const char *key, const char * &dest) {
-        return load_value_(key, dest, [](auto &&...) { return true; });
+        return load_value_(key, dest, [](YAML::Node node, const char * &dest) {
+            dest = node.Scalar().c_str();
+            return true;
+        });
     }
 
     bool load_value(const char *key, fs::path &path) {
@@ -178,4 +176,8 @@ private:
             }
         }
     }
+};
+
+namespace G {
+    config cfg;
 };

@@ -9,7 +9,6 @@ allowed-ips:
   - 192.168.1.0/24
 
 # pasv-ip: 127.0.0.1
-# pasv-port: 20
 
 # max-connections: 1000
 # max-connections-per-ip: 10

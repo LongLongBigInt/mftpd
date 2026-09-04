@@ -53,7 +53,9 @@ bool parse_and_eval_message(connection &c) {
                         syntax_error_variant::message_too_long>(c.stream);
                 skip = false;
             } else {
-                if (cmd_dispatch(c, begin, sep, i-1)) {
+                // 注意此时可能已经关闭了（quit后同一批次的报文）
+                // 需要忽略
+                if (c.closing || cmd_dispatch(c, begin, sep, i-1)) {
                     return true;
                 }
             }
@@ -139,19 +141,18 @@ void on_PORT_connected(connection &c) {
     // 不论成功与否，connector应该从事件循环中被移除
     G::ep.del(c.dstream);
 
-    if (!err) {
-        start_data_transfer(c);
+    if (err) {
+        c.dstream.close();
+        respond<ftpd_code::transfer_not_open,
+                transfer_not_open_variant::socket_error>
+                (c.stream, strerror(err));
+
+        c.m = transfer_mode::unset;
+        c.ts = transfer_state::idle;
         return;
     }
 
-    // 连接失败
-    c.dstream.close();
-    respond<ftpd_code::transfer_not_open,
-            transfer_not_open_variant::socket_error>
-            (c.stream, strerror(err));
-
-    c.m = transfer_mode::unset;
-    c.ts = transfer_state::idle;
+    start_data_transfer(c);
 }
 
 int main(int argc, char const *argv[])

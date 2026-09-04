@@ -11,7 +11,7 @@ void do_USER(connection &c, const char *name) {
         // 本用户重复USER视为已登录（防止某些客户端重试）
         // 否则不支持重新登录（连接中发送USER的语义有分歧：数据传输是否要断开？）
         // 建议用户使用语义更明确的 (ABOR)+REIN+USER
-        if (c.u["name"].Scalar() == name) {
+        if (c.u.name == name) {
             respond<ftpd_code::logged_in>(c.stream);
         } else {
             respond<ftpd_code::invalid_argument,
@@ -19,7 +19,7 @@ void do_USER(connection &c, const char *name) {
         }
         return;
     }
-    c.u = G::cfg.find_user(name);
+    c.u = G::cfg.get_user(name);
     c.ss = session_state::need_pass;
     respond<ftpd_code::require_pass>(c.stream, name);
 }
@@ -30,9 +30,9 @@ void do_PASS(connection &c, const char *pass) {
         return;
     }
 
-    if (!c.u) goto pass_fail;
+    if (c.u.name.empty()) goto pass_fail;
 
-    if (!c.u["pass"] || c.u["pass"].Scalar() == pass) {
+    if (c.u.pass.empty() || c.u.pass == pass) {
         goto pass_success;
     }
 
@@ -43,41 +43,34 @@ pass_fail:
 
 pass_success:
     c.ss = session_state::auth;
-    if (!config::get_dir(c.u["home"], c.home)) {
-        c.home = G::cfg.default_home;
-    }
     respond<ftpd_code::logged_in>(c.stream);
 
     DEBUG("Connection %d: User %s logged in",
-        c.stream.native_handle(), c.u["name"].Scalar().c_str());
+        c.stream.native_handle(), c.u.name.data());
 }
 
-std::string _get_escaped_path(
-    const char *formal_path, 
-    const char *first_quote
-) {
-    std::string res(formal_path, first_quote);
-    const char *cur = first_quote;
-    while (*cur) {
-        const char quote = '"';
+// 将FTP路径转化为打印路径
+// 在前面增加前缀（/），引号转义加倍
+// 需要保证传入的路径已经正规化了
+std::string get_escaped_path(const char *formal_path) {
+    const char quote = '"', *prefix = "/";
+    std::string res = prefix;
+    
+    for (const char *cur = formal_path; *cur; ++cur) {
         res.push_back(*cur);
         if (*cur == quote) {
             res.push_back(*cur);
         }
-        ++cur;
     }
+    
     return res;
 }
-
-#define get_escape_path(path, first_quote) \
-(first_quote ? path : _get_escaped_path(path, first_quote).c_str())
 
 void do_PWD(connection &c) {
     if (!ensure_auth(c)) return;
 
-    const char *path = c.wd.c_str(), *quote = strchr(path, '"');
     respond<ftpd_code::printdir, printdir_variant::pwd>
-        (c.stream, get_escape_path(path, quote));
+        (c.stream, get_escaped_path(c.wd.c_str()).c_str());
 }
 
 void do_CWD(connection &c, const char *path) {
@@ -96,12 +89,12 @@ void do_MKD(connection &c, const char *path) {
     if (!ensure_auth(c)) return;
 
     fs::path target = (c.wd / path).lexically_normal();
-    if (!ensure_target(c, target, target_type::dir_only)) {
+    if (!ensure_target(c, target, target_type::non_exist)) {
         return;
     }
 
     std::error_code ec;
-    bool ok = fs::create_directory(target, ec);
+    bool ok = fs::create_directory(c.u.home / target, ec);
     if (ec) {
         respond<ftpd_code::action_fail, action_fail_variant::system_error>
             (c.stream, strerror(ec.value()));
@@ -109,22 +102,21 @@ void do_MKD(connection &c, const char *path) {
         respond<ftpd_code::action_fail, action_fail_variant::already_exist>
             (c.stream);
     } else {
-        const char *path = target.c_str(), *quote = strchr(path, '"');
         respond<ftpd_code::printdir, printdir_variant::mkd>
-            (c.stream, get_escape_path(path, quote));
+            (c.stream, get_escaped_path(target.c_str()).c_str());
     }
 }
 
 void do_unlink(connection &c, const char *path, bool is_regular) {
     if (!ensure_auth(c)) return;
 
-    fs::path target = c.wd / path;
+    fs::path target = (c.wd / path).lexically_normal();
     if (!ensure_target(c, target, is_regular ? file_only : dir_only)) {
         return;
     }
 
     std::error_code ec;
-    bool ok = fs::remove(target, ec);
+    bool ok = fs::remove(c.u.home / target, ec);
     if (ec) {
         respond<ftpd_code::action_fail, action_fail_variant::system_error>
             (c.stream, strerror(ec.value()));
@@ -210,9 +202,8 @@ void do_PASV(connection &c) {
     
     abort_transfer_preparation(c);
 
-    // TODO: 固定的pasv-port/pasv-ip绑定可能抛异常
     c.dacceptor = sock<tcp, ip>::create()
-        .bind_reuse({G::cfg.pasv_port, G::cfg.pasv_ip})
+        .bind_reuse({0, G::cfg.pasv_ip})
         .listen(FTPD_BACKLOG);
     c.daddr = c.dacceptor.addr();
     c.m = transfer_mode::passive;
@@ -270,7 +261,7 @@ void do_REIN(connection &c) {
         abort_transfer_preparation(c);
     }
     c.ss = session_state::before_auth;
-    
+    c.wd.clear();
     // 接待新用户
     respond<ftpd_code::welcome>(c.stream, G::cfg.welcome_message);
 }

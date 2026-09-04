@@ -74,7 +74,7 @@ void prepare_data_transfer(
     const fs::path &path
 ) {
     c.dcmd = cmd;
-    c.dpath = std::move(path);
+    c.dpath = c.u.home / path;
     c.ts = transfer_state::before_transfer;
 
     switch (c.m) {
@@ -189,13 +189,13 @@ enum target_type {
 bool ensure_target(
     connection &c, 
     const fs::path &target_path,
-    target_type expected_type, // S_IF...
+    target_type expected_type,
     struct stat *status_out_p = nullptr
 ) {
-    fs::path real_target = (c.home / c.wd).lexically_normal();
-    if (!ensure_permission(c, real_target)) {
+    if (!ensure_permission(c, target_path)) {
         return false;
     }
+    fs::path real_target = (c.u.home / target_path).lexically_normal();
     struct stat buf, *st = status_out_p ? status_out_p : &buf;
 
     bool ok = stat(real_target.c_str(), st) == 0;

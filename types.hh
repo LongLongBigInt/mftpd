@@ -1,6 +1,7 @@
 #pragma once
 
 #include "globals.hh"
+#include "config.hh"
 
 #include <atomic>
 #include <sys/stat.h>
@@ -38,11 +39,6 @@ enum transfer_event {
     none, network_err, local_err, aborted, destroy
 };
 
-using user_data_p = YAML::Node;
-
-struct connection;
-union epoll_data encode_ptr(handle_type type, connection *c);
-
 struct transfer_handler;
 
 struct rate_limiter {
@@ -57,13 +53,15 @@ struct rate_limiter {
         ++G::ip_connections[ip];
     }
     ~rate_limiter() {
-        const int delta = 10;
+        const int delta = G::cfg.max_connections > 100 ? 10 : 0;
         int gc = --G::connections;
         if (!G::ctl.evloop() && gc < G::cfg.max_connections - delta) {
-            G::ep.add(G::ctl, { epoll::in, 
-                encode_ptr(control_acceptor, nullptr) });
+            G::ep.add(G::ctl, { epoll::in, { .u64 = 0x0 } });
         }
-        --G::ip_connections[ip];
+        auto it = G::ip_connections.find(ip);
+        if (--it->second == 0) {
+            G::ip_connections.erase(it);
+        }
     }
 };
 
@@ -79,18 +77,17 @@ struct connection {
     ip daddr;
 
     // FTP 状态
-    user_data_p u; /* 用户数据 */
+    user_info u; /* 用户数据 */
     session_state ss = session_state::before_auth;
     transfer_state ts = transfer_state::idle;
-    fs::path home;
     fs::path wd; /* 当前工作目录 */
-    transfer_mode m = unset; /* 当前数据传输模式 */
+    transfer_mode m = transfer_mode::unset; /* 当前数据传输模式 */
     data_commands dcmd; /* 当前数据传输命令 */
     fs::path dpath; /* 当前数据传输路径 */
     struct stat dst;
     std::unique_ptr<transfer_handler> handler;
     efd ef; /* 接收工作线程信息的eventfd */
-    std::atomic<transfer_event> wf; /* 主线程给工作线程的标志 */
+    std::atomic<transfer_event> wf = transfer_event::none; /* 主线程给工作线程的标志 */
 
     // 报文解析状态
     struct {
@@ -107,8 +104,8 @@ struct connection {
         laddr = this->stream.addr();
         DEBUG("Connection %d: accepted peer %s on %s",
             this->stream.native_handle(), 
-            laddr.to_string().c_str(), 
-            addr.to_string().c_str());
+            addr.to_string().c_str(),
+            laddr.to_string().c_str());
     }
 
     ~connection() {
